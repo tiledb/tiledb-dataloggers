@@ -1,0 +1,12 @@
+# Ignore Python virtual environment
+.pyenv
+*.pyc
+__pycache__/
+tcl/*
+tmp/*
+vivado_logs/*
+# Ignore logs
+*.log
+
+# Ignore system files
+.DS_Store
