@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Service Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+
+<body class="p-4">
+
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h2>Service Dashboard</h2>
+
+        <div>
+            {% if config["features"].getboolean("config_editor") %}
+            <a href="/config" class="btn btn-warning btn-sm">Configuration</a>
+            {% endif %}
+
+            {% if config["auth"].getboolean("enabled") %}
+            <a href="/logout" class="btn btn-secondary btn-sm">Logout</a>
+            {% endif %}
+        </div>
+    </div>
+
+    {% if config["features"].getboolean("system_monitoring") %}
+    <div class="row mb-4">
+        <div class="col-md-4">
+            <div class="card p-3 shadow-sm text-center">
+                <h6>CPU Usage</h6>
+                <h4 id="cpu">--%</h4>
+            </div>
+        </div>
+
+        <div class="col-md-4">
+            <div class="card p-3 shadow-sm text-center">
+                <h6>RAM Usage</h6>
+                <h4 id="ram">--%</h4>
+            </div>
+        </div>
+
+        <div class="col-md-4">
+            <div class="card p-3 shadow-sm text-center">
+                <h6>Disk Usage (/)</h6>
+                <h4 id="disk">--%</h4>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    <table class="table table-bordered table-striped">
+        <thead>
+            <tr>
+                <th>Service</th>
+                <th>Status</th>
+                <th>Enabled</th>
+                <th>Actions</th>
+                <th>Logs</th>
+            </tr>
+        </thead>
+        <tbody id="services-table">
+            {% for service, info in statuses.items() %}
+            <tr id="row-{{ service }}">
+                <td>{{ service }}</td>
+                <td class="status">{{ info.active }}</td>
+                <td class="enabled">{{ info.enabled }}</td>
+                <td>
+                    <button onclick="sendAction('start','{{ service }}')" class="btn btn-success btn-sm">Start</button>
+                    <button onclick="sendAction('stop','{{ service }}')" class="btn btn-danger btn-sm">Stop</button>
+                    <button onclick="sendAction('restart','{{ service }}')"
+                        class="btn btn-warning btn-sm">Restart</button>
+                    <button onclick="sendAction('enable','{{ service }}')" class="btn btn-info btn-sm">Enable</button>
+                    <button onclick="sendAction('disable','{{ service }}')"
+                        class="btn btn-secondary btn-sm">Disable</button>
+                </td>
+                <td>
+                    <a href="/logs/{{ service }}" class="btn btn-primary btn-sm">Logs</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <script>
+        function updateStatus() {
+            fetch("/api/all_status")
+                .then(response => response.json())
+                .then(data => {
+                    for (const [service, info] of Object.entries(data)) {
+                        let row = document.getElementById("row-" + service);
+                        if (row) {
+                            // Update status text
+                            let statusCell = row.querySelector(".status");
+                            statusCell.innerText = info.active;
+
+                            // Update badge color
+                            statusCell.className = "status badge ";
+                            if (info.active === "active") {
+                                statusCell.classList.add("bg-success");
+                            } else if (info.active === "inactive") {
+                                statusCell.classList.add("bg-danger");
+                            } else {
+                                statusCell.classList.add("bg-secondary");
+                            }
+
+                            // Update enabled text
+                            row.querySelector(".enabled").innerText = info.enabled;
+                        }
+                    }
+                });
+        }
+
+        // Send start/stop/restart/enable/disable actions
+        function sendAction(action, service) {
+            fetch(`/api/${action}/${service}`, { method: "POST" })
+                .then(() => setTimeout(updateStatus, 500));
+        }
+
+        // Update services every 2 seconds
+        setInterval(updateStatus, 2000);
+        updateStatus();  // Initial load
+
+
+        function updateSystem() {
+            {% if config["features"].getboolean("system_monitoring") %}
+            fetch("/api/system")
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById("cpu").innerText = data.cpu + "%";
+                    document.getElementById("ram").innerText = data.ram + "%";
+                    document.getElementById("disk").innerText = data.disk + "%";
+                });
+            {% endif %}
+        }
+
+        function sendAction(action, service) {
+            fetch(`/api/${action}/${service}`, { method: "POST" })
+                .then(() => setTimeout(updateStatus, 500));
+        }
+
+        setInterval(updateStatus, 2000);
+        setInterval(updateSystem, 2000);
+
+        updateStatus();
+        updateSystem();
+    </script>
+
+</body>
+
+</html>

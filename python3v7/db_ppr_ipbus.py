@@ -44,9 +44,46 @@ class IPbus:
 
     def RODRead(self, chan, gain, num):
         addr = 0x100 + (chan * num)
+        # Read array of num elements
+        raw_data = self.ipbus.Read(addr, num)
+        print(f"RODRead addr: {hex(addr)} num: {num} raw_data: {raw_data}")
+        # Apply bitwise operations to each element based on gain
+        if not gain:
+            # For gain=False: mask each element to 12 bits
+            data = [value & 0xFFF for value in raw_data]
+        else:
+            # For gain=True: shift each element right by 16 bits, then mask to 12 bits
+            data = [(value >> 16) & 0xFFF for value in raw_data]
+        
+        return data
+
+    def RODReadOld(self, chan, gain, num):
+        addr = 0x100 + (chan * num)
         if not gain:
             addr = 0x700 + (chan * num)
         return self.ipbus.Read(addr, num)
+
+    def RODReadMD(self, md=0, nchan=12, nsamp=16, stride=32):
+        """
+        Read CIS data from multiple channels with memory stride.
+
+        Args:
+            firstMD (int): The first module (MD) index for this read
+            nchan (int): Number of channels to read (default 12)
+            nsamp (int): Number of samples per channel (default 16)
+            stride (int): Memory spacing between channels (default 32)
+
+        Returns:
+            List[List[int]]: A list of channels, each containing nsamp samples.
+                             Example: data[channel][sample]
+        """
+        data = []
+        for ch in range(nchan):
+            addr = 0x100 + stride * (ch + 12 * md)
+            samples = self.ipbus.Read(addr, nsamp)
+            data.append(samples)
+        return data
+
 
     def RODReadChunck(self, addr, num):
         return self.ipbus.Read(addr, num)
