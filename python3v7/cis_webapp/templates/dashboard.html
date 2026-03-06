@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>CIS Dashboard - Dark Theme</title>
+    <script src="https://cdn.plot.ly/plotly-2.26.1.min.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+
+<body>
+    <h1>CIS Dashboard (HG + LG)</h1>
+
+    <div class="md-grid">
+        {% for md_label in md_labels %}
+        <div class="md-box">
+            <div id="plotly-div-{{ loop.index }}" class="fade-plot"></div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <script src="{{ url_for('static', filename='plot_md.js') }}"></script>
+</body>
+
+</html>

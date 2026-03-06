@@ -1,0 +1,65 @@
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    background-color: #111111;
+    color: white;
+    font-family: Arial, sans-serif;
+}
+
+h1 {
+    text-align: center;
+    margin: 10px 0;
+}
+
+/* Full-screen 2x2 MD grid */
+.md-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    grid-gap: 10px;
+    height: calc(100vh - 60px);
+    padding: 5px;
+    box-sizing: border-box;
+}
+
+/* MD boxes with soft borders and hover effect */
+.md-box {
+    border: 2px solid rgba(255,255,255,0.3);
+    border-radius: 12px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+    background: linear-gradient(135deg, #111111, #1a1a1a);
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.md-box:hover {
+    transform: scale(1.02);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.6);
+}
+
+/* Plotly fills container */
+.fade-plot {
+    width: 100% !important;
+    height: 100% !important;
+    opacity: 1;
+}
+
+/* Add this at the bottom of your existing CSS */
+
+.fade-plot .scatterlayer .trace .points path {
+    transition: filter 0.3s ease, r 0.3s ease;
+}
+
+.fade-plot .scatterlayer .trace .points path:hover {
+    filter: drop-shadow(0 0 6px #FF0000); /* HG red glow */
+}
+
+/* LG hover glow */
+.fade-plot .scatterlayer .trace .points path:nth-child(2):hover {
+    filter: drop-shadow(0 0 6px #00FFFF); /* LG cyan glow */
+}
