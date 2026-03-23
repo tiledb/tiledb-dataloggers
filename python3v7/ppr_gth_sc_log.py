@@ -10,7 +10,8 @@ from db_ppr_ipbus import IPbus
 from db_influx_lib import *
 
 # -------------------- INFLUXDB SETUP --------------------
-host = "piro-atlas-lab.fysik.su.se"
+# host = "piro-atlas-lab.fysik.su.se"
+host = "192.168.0.200"
 port = 8086
 username = "tiledb"
 password = "T1le-db-word!"

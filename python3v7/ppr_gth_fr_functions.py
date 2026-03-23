@@ -124,6 +124,7 @@ def analyze_pulse(samples,
     return pedestal, peak_value, peak_index, center_of_mass, fwhm
 
 
+
 def adc_lin_test(ppr, feb, ppr_label):
     bcid_l1a = 3200
     dbside = 0  # All FPGAs
@@ -148,6 +149,8 @@ def adc_lin_test(ppr, feb, ppr_label):
 
     avgHG = [[] for _ in range(nchanperMD * nMD)]
     avgLG = [[] for _ in range(nchanperMD * nMD)]
+    stdHG = [[] for _ in range(nchanperMD * nMD)]
+    stdLG = [[] for _ in range(nchanperMD * nMD)]
 
 
     # ------------------ CONFIG PHASE -------------------
@@ -233,10 +236,15 @@ def adc_lin_test(ppr, feb, ppr_label):
 
                         hg_mean = sum(hg_data) / len(hg_data)
                         lg_mean = sum(lg_data) / len(lg_data)
+                        
+                        hg_stddev = math.sqrt(sum((x - hg_mean) ** 2 for x in hg_data) / len(hg_data))
+                        lg_stddev = math.sqrt(sum((x - lg_mean) ** 2 for x in lg_data) / len(lg_data))
                         # print(f"  Step {step} Event {event}: MD{md} ADC{adc} HG data={hg_data} LG data={lg_data}")
                         
                         avgHG[md * nchanperMD + adc].append(hg_mean)
                         avgLG[md * nchanperMD + adc].append(lg_mean)
+                        stdHG[md * nchanperMD + adc].append(hg_stddev)
+                        stdLG[md * nchanperMD + adc].append(lg_stddev)
                         # print(f"  Step {step} Event {event}: MD{md} ADC{adc} HG mean={hg_mean:.2f} LG mean={lg_mean:.2f}")
                         # time.sleep(1)  # small delay for readability
                         
@@ -270,8 +278,12 @@ def adc_lin_test(ppr, feb, ppr_label):
     time.sleep(0.1)  # small delay to ensure settings are applied
 
     all_points = []
+    now = datetime.datetime.utcnow().isoformat()
+    
     for md in range(nMD):
         # ascii_plot_grid(md, step_x, avgHG, avgLG, nchanperMD=nchanperMD, ncols=6, nrows=2, width=20, height=20)
+        
+        
         
         for ch in range(nchanperMD):
             idx = md * nchanperMD + ch
@@ -287,7 +299,7 @@ def adc_lin_test(ppr, feb, ppr_label):
                 "tags": {
                     f"{ppr_label} MD{md+1}": f"CH{ch}",
                 },
-                "time": datetime.datetime.utcnow().isoformat(),
+                "time": now,
                 "fields": {
                     "slope_hg": float(slope_hg),
                     "slope_lg": float(slope_lg),
@@ -299,6 +311,42 @@ def adc_lin_test(ppr, feb, ppr_label):
                     "maxdev_lg": float(maxdev_lg)
                 }
             })
+            
+            
+            
+
+            for step_i, adc_in in enumerate(step_x):
+
+                all_points.append({
+                    "measurement": "ADC_Linearity_Samples",
+                    "tags": {
+                        "channel": f"{ppr_label}_MD{md+1}_CH{ch}",
+                        "gain": "HG",
+                        "step": step_i
+                    },
+                    "time": now,
+                    "fields": {
+                        "adc_input": float(adc_in),
+                        "value": float(avgHG[idx][step_i]),
+                        "std": float(stdHG[idx][step_i])
+                    }
+                })
+
+                all_points.append({
+                    "measurement": "ADC_Linearity_Samples",
+                    "tags": {
+                        "channel": f"{ppr_label}_MD{md+1}_CH{ch}",
+                        "gain": "LG",
+                        "step": step_i
+                    },
+                    "time": now,
+                    "fields": {
+                        "adc_input": float(adc_in),
+                        "value": float(avgLG[idx][step_i]),
+                        "std": float(stdLG[idx][step_i])
+                    }
+                })
+            
 
     return all_points
 
@@ -822,6 +870,7 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
         #     f"{a0:<12}{a1:<12}{da:<12}"
         #     f"{b0:<12}{b1:<12}{db:<12}")
     
+    now = datetime.datetime.utcnow().isoformat()
     
     for md in range(firstMD, firstMD + nMD):
         # print(f"\n==> MD{md} summary")
@@ -859,6 +908,26 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
                 delta_crc = all_delta_crc_errors_sideB[md]
         
             if gain == 1:
+                for step_i, dac in enumerate(step_x):
+
+                    hg_val = step_hg_peaks[step_i, ch]
+                    # lg_val = step_lg_peaks[step_i, ch]
+
+                    all_points.append({
+                        "measurement": "CIS_Linearity_Samples",
+                        "tags": {
+                            "channel": f"{ppr_label}_MD{md+1}_CH{ch}",
+                            "gain": "HG",
+                            "step": step_i
+                        },
+                        "time": now,
+                        "fields": {
+                            "dac_charge": float(dac),
+                            "value": float(hg_val)
+                        }
+                    })
+
+                    
                 all_points.append({
                         "measurement": "CIS_Linearity",
                         "tags": {
@@ -881,6 +950,26 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
                         }
                     })
             else:
+                
+                
+                for step_i, dac in enumerate(step_x):
+                    # hg_val = step_hg_peaks[step_i, ch]
+                    lg_val = step_lg_peaks[step_i, ch]    
+                    
+                    all_points.append({
+                        "measurement": "CIS_Linearity_Samples",
+                        "tags": {
+                            "channel": f"{ppr_label}_MD{md+1}_CH{ch}",
+                            "gain": "LG",
+                            "step": step_i
+                        },
+                        "time": now,
+                        "fields": {
+                            "dac_charge": float(dac),
+                            "value": float(lg_val)
+                        }
+                    })
+                                    
                 all_points.append({
                         "measurement": "CIS_Linearity",
                         "tags": {
@@ -903,4 +992,128 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
                         }
                     })
     
+    return all_points
+
+
+def integrator_lin_test(ppr, feb, ppr_label, nsteps=20, step_events=1):
+    all_points = []
+
+    nsamp = 1  # integrator readout returns 1 value
+    nchanperMD = 12
+    nMD = 4
+    firstMD = 0
+    dbside = 0
+
+    min_DAC = 0
+    max_DAC = 4095
+    step_length = (max_DAC - min_DAC) / (nsteps - 1)
+
+    step_x = []
+
+    # Store values: list of steps → flat channel array
+    all_values = []
+
+    # ------------------ CONFIG PHASE -------------------
+
+    ppr.set_global_TTC_internal()
+
+    ppr.set_global_trigger_deadtime(0)
+    ppr.set_global_trigger_deadtime(1)
+
+    feb.set_FEB_ADC_bias_offsets_DACs()
+    feb.set_FEB_load_ADC_DACs()
+    feb.set_FEB_switches()
+
+    feb.set_CIS_Integrator_BCID_settings()
+
+    # integrator readout frequency
+    readout_frequency = 112
+    feb.async_write(None, 0x115, readout_frequency)
+
+    # internal TTC mode
+    ppr.write(0x4, 0)
+
+    feb.set_integrator_switches()
+
+    # Initialize DAC = 0
+    feb.set_FEB_integrator_DACs(charge=0)
+    ppr.reset_integrator_fifo()
+    time.sleep(0.2)
+
+    # ------------------ DAC SWEEP -------------------
+
+    for step in range(nsteps):
+
+        DACcharge = int(min_DAC + step * step_length)
+        step_x.append(DACcharge)
+
+        feb.set_FEB_integrator_DACs(charge=DACcharge)
+        ppr.reset_integrator_fifo()
+        time.sleep(0.1)
+
+        step_values = []
+
+        for md in range(firstMD, firstMD + nMD):
+            for adc in range(nchanperMD):
+
+                vals = []
+                for event in range(step_events):
+                    data = ppr.get_data_integrator(md, adc, nsamp)
+                    if data:
+                        vals.append(max(data))
+
+                avg_val = sum(vals) / len(vals) if vals else 0
+                step_values.append(avg_val)
+
+        all_values.append(step_values)
+
+    # Convert to numpy-like structure
+    all_values = np.array(all_values)  # shape: (steps, channels)
+
+    now = datetime.datetime.utcnow().isoformat()
+
+    # ------------------ ANALYSIS -------------------
+
+    for md in range(firstMD, firstMD + nMD):
+
+        for ch in range(nchanperMD):
+
+            idx = md * nchanperMD + ch
+            y = all_values[:, idx]
+
+            slope, intercept, r2, maxdev = linear_fit(step_x, y)
+            mean_val, std_val = avg_std(y)
+
+            # -------- Summary --------
+            all_points.append({
+                "measurement": "Integrator_Linearity",
+                "tags": {
+                    f"{ppr_label} MD{md+1}": f"CH{ch}",
+                },
+                "time": now,
+                "fields": {
+                    "slope": float(slope),
+                    "intercept": float(intercept),
+                    "r2": float(r2),
+                    "maxdev": float(maxdev),
+                    "mean": float(mean_val),
+                    "std": float(std_val)
+                }
+            })
+
+            # -------- Samples --------
+            for step_i, dac in enumerate(step_x):
+                all_points.append({
+                    "measurement": "Integrator_Linearity_Samples",
+                    "tags": {
+                        "channel": f"{ppr_label}_MD{md+1}_CH{ch}",
+                        "step": step_i
+                    },
+                    "time": now,
+                    "fields": {
+                        "dac_charge": float(dac),
+                        "value": float(all_values[step_i, idx])
+                    }
+                })
+
     return all_points

@@ -16,7 +16,8 @@ from db_influx_lib import *
 # ==========================================================
 # INFLUXDB SETUP
 # ==========================================================
-host = "piro-atlas-lab.fysik.su.se"
+# host = "piro-atlas-lab.fysik.su.se"
+host = "192.168.0.200"
 port = 8086
 username = "tiledb"
 password = "T1le-db-word!"
@@ -73,6 +74,12 @@ ipbus = IPbus(controlhub_ipaddress, ppr_ipaddress)
 while True:
 
     try:
+        
+        all_points = []
+        all_points = integrator_lin_test(ppr, feb, ppr_label)
+        influxdb.write_points(all_points)
+        time.sleep(10)
+        
         all_points = []
         all_points = adc_lin_test(ppr, feb, ppr_label)
         influxdb.write_points(all_points)
@@ -103,6 +110,7 @@ while True:
         influxdb.write_points(all_points)
         time.sleep(10)
         
+
         
         # time.sleep(60)
         

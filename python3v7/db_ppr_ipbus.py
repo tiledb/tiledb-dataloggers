@@ -208,10 +208,14 @@ class PPr:
     # Basic Read/Write
     # -------------------------------------------------
 
-    def read(self, addr, size=None):
+    def read(self, addr, size=None, fifo=False):
         if size:
-            return self.ipbus.Read(addr, size)
+            if fifo:
+                return self.ipbus.ReadFIFO(addr, size,fifo)
+            else:
+                return self.ipbus.Read(addr, size)
         return self.ipbus.Read(addr, 1)
+
 
     def write(self, addr, *values):
         if len(values) == 1:
@@ -219,7 +223,6 @@ class PPr:
         else:
             self.ipbus.Write(addr, list(values))
         return True
-
 
     # -------------------------------------------------
     # Firmware
@@ -529,20 +532,41 @@ class PPr:
     # Integrator
     # -------------------------------------------------
 
-    def get_data_integrator(self, md, adc, samples):
+    def get_data_integrator(self, md: int, adc: int, samples: int = 1):
+        """
+        Reads input single samples from Integrator Slow Readout (Python version of Java function)
+        """
+        dead_beef = True
         offset = md * 12
-        address = PPrReg.INTEGRATOR_SLOW_READOUT + (adc + offset)
 
-        while True:
-            values = self.read(address, samples)
-            values = [v & 0xFFFF for v in values]
-            if values[0] != 0xDEADBEEF:
-                return values
+        integrator_value = None
+
+        while dead_beef:
+            # Read from integrator FIFO
+            integrator_value = self.read(
+                PPrReg.INTEGRATOR_SLOW_READOUT + (DBReg.ADC_MAP[adc] + offset),
+                size=samples
+            )
+
+            # If single int, convert to list
+            if isinstance(integrator_value, int):
+                integrator_value = [integrator_value]
+            # print(integrator_value, end=" -> ")
+            # Mask each value to 16-bit
+            integrator_value = [v & 0xFFFF for v in integrator_value]
+            # print(integrator_value)
+            # Exit loop if first value is not 0xDEADBEEF
+            if integrator_value[0] != 0xDEADBEEF:
+                dead_beef = False
+
+        return integrator_value
 
     def reset_integrator_fifo(self):
         self.write(PPrReg.INTEGRATOR_FIFO, 0x10000)
         self.write(PPrReg.INTEGRATOR_FIFO, 0x0)
         return True
+
+
 
     # -------------------------------------------------
     # FEB Control
@@ -596,6 +620,27 @@ class FEB:
     # Low-level command builders
     # ========================================================
 
+    def async_write(self, md=None, addr=0, command=0):
+        if md is None:
+            for md in range(4):
+                addr = BitTools.set_bit(13, 1, addr)
+                addr = BitTools.set_bit(12, 1, addr)
+                self.io.write(PPrReg.ASYNC_ADDRESS, (md+1 << 28) & PPrReg.ASYNC_ADDRESS_MD_MASK + addr, command)
+        else:
+                addr = BitTools.set_bit(13, 1, addr)
+                addr = BitTools.set_bit(12, 1, addr)
+                self.io.write(PPrReg.ASYNC_ADDRESS, (md+1 << 28) & PPrReg.ASYNC_ADDRESS_MD_MASK + addr, command)
+        
+        return True
+                
+                
+    def sync_write(self, bcid, addr, command):
+        addr = BitTools.set_bit(13, 1, addr)
+        addr = BitTools.set_bit(12, 1, addr)
+        self.io.write(PPrReg.SYNC_ADDRESS, addr, command)
+
+
+
     def _build_async_address(self, md: int, dbside: int) -> int:
         addr = (md << 28) & PPrReg.ASYNC_ADDRESS_MD_MASK
 
@@ -624,12 +669,14 @@ class FEB:
             print(f"send_asyncFEcommand MD={md} DB={dbside}")
             print(f"ADDR=0x{addr:08X} CMD=0x{command:08X}")
 
-        return self.io.write(PPrReg.ASYNC_ADDRESS, addr, command)
+        self.io.write(PPrReg.ASYNC_ADDRESS, addr, command)
+        return True
 
     def send_asyncCIScommand(self, md: int, dbside: int, command: int) -> bool:
         addr = self._build_async_address(md, dbside)
         addr |= DBReg.DB_CIS
-        return self.io.write(PPrReg.ASYNC_ADDRESS, addr, command)
+        self.io.write(PPrReg.ASYNC_ADDRESS, addr, command)
+        return True
 
     # ========================================================
     # SYNC COMMANDS
@@ -670,10 +717,9 @@ class FEB:
     # ========================================================
 
     def _transmit_double(self, md, dbside, command_base):
-        if not self.send_asyncFEcommand(md, dbside, command_base):
-            return False
-        return self.send_asyncFEcommand(
-            md, dbside, command_base | DBReg.CMD_BIT_E_MASK)
+        self.send_asyncFEcommand(md, dbside, command_base)
+        self.send_asyncFEcommand(md, dbside, command_base | DBReg.CMD_BIT_E_MASK)
+        return True
 
     # ========================================================
     # CIS DAC
@@ -806,12 +852,20 @@ class FEB:
                               BCID_discharge,
                               gain):
 
+        # command = ((BCID_discharge << 14)
+        #            | (BCID_charge << 2)
+        #            | (gain << 1)
+        #            | 0x0)
+
+        # self.send_asyncCIScommand(md, dbside, command)
+        
         command = ((BCID_discharge << 14)
                    | (BCID_charge << 2)
                    | (gain << 1)
                    | 0x1)
 
-        return self.send_asyncCIScommand(md, dbside, command)
+        self.send_asyncCIScommand(md, dbside, command)
+        return True
 
     # ========================================================
     # Pedestal conversions
@@ -833,6 +887,301 @@ class FEB:
         v2 = 2261 - diff
 
         return [v1, v2]
+
+
+
+    def set_FEB_ADC_bias_offsets_DACs(self, ADCped = 200, md=None, dbside=0, verbose=False):
+        """
+        Set FEB ADC bias offsets (pedestals) for all MDs and FEBs.
+        Uses the FEB methods: set_ped_HG_pos, set_ped_HG_neg, set_ped_LG_pos, set_ped_LG_neg.
+        """
+        ret = True
+        DACbiasP, DACbiasN = self.convert_ped_ADC_to_DACs(ADCped)
+
+        # Determine which MDs to process
+        if md is None:
+            MDmin, MDmax = 0, 4
+        else:
+            MDmin, MDmax = md, md + 1
+
+        mdidx = 0
+        for md in range(MDmin, MDmax):
+
+            for feb in range(12):  # loop over FEB channels
+                r = self.set_ped_HG_pos(md, dbside, feb, DACbiasP)
+                ret = ret and r
+                if verbose:
+                    print(f"  MD {md} FEB {feb} set ped HGpos: {DACbiasP} -> {'Ok' if r else 'Fail'}")
+
+                r = self.set_ped_HG_neg(md, dbside, feb, DACbiasN)
+                ret = ret and r
+                if verbose:
+                    print(f"  MD {md} FEB {feb} set ped HGneg: {DACbiasN} -> {'Ok' if r else 'Fail'}")
+
+                r = self.set_ped_LG_pos(md, dbside, feb, DACbiasP)
+                ret = ret and r
+                if verbose:
+                    print(f"  MD {md} FEB {feb} set ped LGpos: {DACbiasP} -> {'Ok' if r else 'Fail'}")
+
+                r = self.set_ped_LG_neg(md, dbside, feb, DACbiasN)
+                ret = ret and r
+                if verbose:
+                    print(f"  MD {md} FEB {feb} set ped LGneg: {DACbiasN} -> {'Ok' if r else 'Fail'}")
+
+
+        return ret
+    # -------------------------
+    # FEB ADC pedestal setters
+    # -------------------------
+    def set_ped_HG_pos(self, md, dbside, feb, val):
+        """Set FEB High Gain positive pedestal (DAC)"""
+        command = DBReg.CMD_BIT_E_MASK \
+                | self.feb_to_FPGA(feb) \
+                | self.feb_to_card(feb) \
+                | ((DBReg.CMD_SET_PED_HG_POS << DBReg.CMD_OFFSET) & DBReg.CMD_MASK) \
+                | (val & DBReg.CMD_DATA_MASK)
+        
+        return self.send_asyncFEcommand(md, dbside, command)
+
+
+    def set_ped_HG_neg(self, md, dbside, feb, val):
+        """Set FEB High Gain negative pedestal (DAC)"""
+       
+        command = DBReg.CMD_BIT_E_MASK \
+                | self.feb_to_FPGA(feb) \
+                | self.feb_to_card(feb) \
+                | ((DBReg.CMD_SET_PED_HG_NEG << DBReg.CMD_OFFSET) & DBReg.CMD_MASK) \
+                | (val & DBReg.CMD_DATA_MASK)
+        
+        return self.send_asyncFEcommand(md, dbside, command)
+
+
+    def set_ped_LG_pos(self, md, dbside, feb, val):
+        """Set FEB Low Gain positive pedestal (DAC)"""
+        
+        command = DBReg.CMD_BIT_E_MASK \
+                | self.feb_to_FPGA(feb) \
+                | self.feb_to_card(feb) \
+                | ((DBReg.CMD_SET_PED_LG_POS << DBReg.CMD_OFFSET) & DBReg.CMD_MASK) \
+                | (val & DBReg.CMD_DATA_MASK)
+        
+        return self.send_asyncFEcommand(md, dbside, command)
+
+
+    def set_ped_LG_neg(self, md, dbside, feb, val):
+        """Set FEB Low Gain negative pedestal (DAC)"""
+        command = DBReg.CMD_BIT_E_MASK \
+                | self.feb_to_FPGA(feb) \
+                | self.feb_to_card(feb) \
+                | ((DBReg.CMD_SET_PED_LG_NEG << DBReg.CMD_OFFSET) & DBReg.CMD_MASK) \
+                | (val & DBReg.CMD_DATA_MASK)
+        
+        return self.send_asyncFEcommand(md, dbside, command)
+
+
+
+
+    def set_FEB_integrator_DACs(self, charge: int, md = None, dbside: int = 0, verbose: bool = False) -> bool:
+        """
+        Set the CIS DAC for all FEBs (12 channels) across selected MDs.
+
+        Args:
+            charge (int): DAC value to set
+            MDbroadcast (int): 1 = broadcast to all MDs, 0 = selective MDs
+            MDsel (list): List of flags (1/0) for selected MDs when not broadcasting
+            dbside (int): Which DB side (0, 1, 2)
+            verbose (bool): Print debug info
+        Returns:
+            bool: Success of the last operation
+        """
+        if md is None:
+            MDmin, MDmax =  0, 4
+        else:
+            MDmin, MDmax = md, md+1
+
+        ret = True
+
+        for md in range(MDmin, MDmax):
+
+            for adc in range(12):
+                # Set CIS DAC
+                ret = self.transmit_CIS_DAC(md, dbside, adc, charge)
+
+                # Reset integrator FIFO
+                self.reset_integrator_fifo()
+
+                # Verbose output
+                if verbose:
+                    print(f"  MD: {md} FEB: {adc:2d} set Integrator DAC: {charge} result: {'Ok' if ret else 'Fail'}")
+
+
+        return ret
+
+    def set_integrator_switches(self, gain: int = 1, card_type: int = 1,
+                                md = None, dbside: int = 0,
+                                verbose: bool = False) -> bool:
+        """
+        Sets switches for the Integrator run for selected FEBs.
+
+        Args:
+            selected_gain_plot (str): Gain string (1-6)
+            card_type (int): 0 = 3-in-1, 1 = FENICS2
+            MDbroadcast (int): 1 = broadcast to all MDs, 0 = selective MDs
+            MDsel (list): List of 0/1 for selected MDs if not broadcasting
+            dbside (int): Which DB side
+            verbose (bool): Verbose output
+        Returns:
+            bool: Success of last command
+        """
+        if md is None:
+            MDmin, MDmax = 0, 4
+        else:
+            MDmin, MDmax = md, md + 1
+
+        ret = False
+        sw = [0x8, 0x4, 0x0, 0x2, 0x1, 0x3]
+
+        # Determine gain index
+        gain = gain - 1
+        if verbose:
+            print(f"Gain = {gain}")
+        isw = sw[gain]
+
+        # Build switch value
+        switchval = (0xb << 7) | (isw << 3)
+        if card_type == 1:
+            switchval |= 0x4
+        elif card_type != 0:
+            print("ERROR: Unknown Card Type!!!")
+
+        if verbose:
+            card_name = "3-in-1" if card_type == 0 else "FENICS2"
+            print(f"Card Type: {card_name}")
+            print(f"Switchval = {switchval}")
+
+        # Determine MD range
+        for md in range(MDmin, MDmax):
+            for adc in range(12):
+                command = (1 << 22) + (DBReg.FPGA[adc] << 18) + (DBReg.FPGA_CHANNEL[adc] << 16) + switchval
+                ret = self.send_asyncFEcommand(md, dbside, command)
+                if verbose:
+                    print(f"  MD: {md} FEB: {adc:2d} set Integrator switches result: {'Ok' if ret else 'Fail'}")
+
+
+        return ret
+
+    def set_FEB_load_ADC_DACs(self, md=None, dbside=0) -> bool:
+        """
+        Load ADC/DAC pedestals for all FEB channels.
+
+        Args:
+            MDbroadcast (int): 1 = broadcast to all MDs, 0 = selective MDs
+            MDsel (list): List of 0/1 for selected MDs if not broadcasting
+            dbside (int): Which DB side
+        Returns:
+            bool: Success of the last operation
+        """
+        if md is None:
+            MDmin, MDmax = 0, 4
+        else:
+            MDmin, MDmax = md, md + 1
+
+        ret = True
+
+        for md in range(MDmin, MDmax):
+
+            for adc in range(12):
+                # Load High Gain pedestal
+                ret = self.load_ped_HG(md, dbside, adc)
+                if self.DEBUG:
+                    print(f"  MD: {md} FEB: {adc:2d} load HG result: {'Ok' if ret else 'Fail'}")
+
+                # Load Low Gain pedestal
+                ret = self.load_ped_LG(md, dbside, adc)
+                if self.DEBUG:
+                    print(f"  MD: {md} FEB: {adc:2d} load LG result: {'Ok' if ret else 'Fail'}")
+
+
+
+        return ret
+
+
+    def set_FEB_switches(self, md=None, dbside=0, verbose=False) -> bool:
+        """
+        Set FEB switches for all MDs and FEBs (noise configuration).
+
+        Args:
+            MDbroadcast (int): 1 = broadcast to all MDs, 0 = selective MDs
+            MDsel (list): List of flags (1/0) for selected MDs if not broadcasting
+            dbside (int): Which DB side
+            verbose (bool): Enable verbose output
+
+        Returns:
+            bool: Success of the last operation
+        """
+        ret = True
+
+        if md is None:
+            MDmin, MDmax = 0, 4
+        else:
+            MDmin, MDmax = md, md+1
+
+
+
+
+        for md in range(MDmin, MDmax):
+
+            for adc in range(12):
+                ret = self.set_switches_noise(md, dbside, adc)
+                if verbose:
+                    print(f"  MD: {md} FEB: {adc:2d} set switches result: {'Ok' if ret else 'Fail'}")
+
+        return ret
+
+
+    def set_CIS_Integrator_BCID_settings(self, md=None, dbside=0,
+                            BCID_charge=0, BCID_discharge=0, gain=1, verbose=False) -> bool:
+        """
+        Configure CIS BCID settings for selected MDs.
+
+        Args:
+            MDbroadcast (int): 1 = broadcast to all MDs, 0 = selective MDs
+            MDsel (list): List of flags (1/0) for selected MDs if not broadcasting
+            dbside (int): Which DB side
+            BCID_charge (int): BCID charge setting
+            BCID_discharge (int): BCID discharge setting
+            gain (int): Gain setting
+            verbose (bool): Enable verbose output
+
+        Returns:
+            bool: Success of the last operation
+        """
+        ret = True
+
+        if md is None:
+            MDmin, MDmax = 0 , 4
+        else:    
+            MDmin, MDmax = md, md + 1
+
+
+        for md in range(MDmin, MDmax):
+
+            ret = self.set_CIS_BCID_settings(md, dbside, BCID_charge, BCID_discharge, gain)
+            if verbose:
+                print(f"  MD: {md} CIS configuration result: {'Ok' if ret else 'Fail'}")
+
+
+        return ret
+
+
+
+    def reset_integrator_fifo(self):
+        self.io.write(PPrReg.INTEGRATOR_FIFO, 0x10000)
+        self.io.write(PPrReg.INTEGRATOR_FIFO, 0x0)
+        return True
+
+
+
 
 
 

@@ -2,14 +2,13 @@
 <html>
 
 <head>
-    <title>CIS Dashboard - Dark Theme</title>
+
     <script src="https://cdn.plot.ly/plotly-2.26.1.min.js"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
 </head>
 
 <body>
-    <h1>CIS Dashboard (HG + LG)</h1>
-
+    <h1>Dashboard (HG + LG) {{ test_name }} </h1>
     <div class="md-grid">
         {% for md_label in md_labels %}
         <div class="md-box">
