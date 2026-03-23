@@ -8,13 +8,18 @@
 </head>
 
 <body>
-    <h1>Dashboard (HG + LG) {{ test_name }} </h1>
+    <h1>Dashboard {{ test_name }} </h1>
     <div class="md-grid">
         {% for md_label in md_labels %}
         <div class="md-box">
             <div id="plotly-div-{{ loop.index }}" class="fade-plot"></div>
         </div>
         {% endfor %}
+    </div>
+
+    <div id="controls">
+        <button id="playPauseBtn">⏸ Pause</button>
+        <div id="carouselDots"></div>
     </div>
 
     <script src="{{ url_for('static', filename='plot_md.js') }}"></script>

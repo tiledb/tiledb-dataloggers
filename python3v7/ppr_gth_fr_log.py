@@ -84,11 +84,6 @@ while True:
         all_points = adc_lin_test(ppr, feb, ppr_label)
         influxdb.write_points(all_points)
         time.sleep(10)
-
-        all_points = []
-        all_points = cis_test(ppr, feb, ppr_label)
-        influxdb.write_points(all_points)
-        time.sleep(10)
         
         all_points = []
         all_points = cis_lin_readout(ppr, feb, ppr_label, gain=0)

@@ -3,63 +3,98 @@ html, body {
     padding: 0;
     height: 100%;
     width: 100%;
-    overflow: hidden;
     background-color: #111111;
     color: white;
     font-family: Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden; /* prevent scrolling */
 }
 
 h1 {
     text-align: center;
     margin: 10px 0;
+    flex: 0 0 auto; /* fixed height */
 }
 
-/* Full-screen 2x2 MD grid */
+/* Grid fills remaining space above controls */
 .md-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     grid-template-rows: 1fr 1fr;
     grid-gap: 10px;
-    height: calc(100vh - 60px);
     padding: 5px;
     box-sizing: border-box;
+    flex: 1 1 auto; /* takes all remaining space */
+    min-height: 0; /* important for flex + overflow */
 }
 
-/* MD boxes with soft borders and hover effect */
+/* MD boxes fill grid cells */
 .md-box {
     border: 2px solid rgba(255,255,255,0.3);
     border-radius: 12px;
     box-shadow: 0 4px 15px rgba(0,0,0,0.5);
     background: linear-gradient(135deg, #111111, #1a1a1a);
     width: 100%;
-    height: 100%;
+    height: 100%; /* fixed to cell */
     overflow: hidden;
-    transition: transform 0.3s ease, box-shadow 0.3s ease;
 }
 
-.md-box:hover {
-    transform: scale(1.02);
-    box-shadow: 0 6px 20px rgba(0,0,0,0.6);
-}
-
-/* Plotly fills container */
+/* Plotly divs fill MD box */
 .fade-plot {
     width: 100% !important;
-    height: 100% !important;
+    height: 100% !important; /* crucial: prevent auto resize */
     opacity: 1;
 }
 
-/* Add this at the bottom of your existing CSS */
-
-.fade-plot .scatterlayer .trace .points path {
-    transition: filter 0.3s ease, r 0.3s ease;
+/* Controls bar fixed at bottom of page */
+#controls {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 20px;
+    padding: 10px;
+    background-color: #111111;
+    border-top: 1px solid #333;
+    flex: 0 0 auto; /* fixed height */
+    box-sizing: border-box;
+    height: 60px;
 }
 
-.fade-plot .scatterlayer .trace .points path:hover {
-    filter: drop-shadow(0 0 6px #FF0000); /* HG red glow */
+/* Play/Pause button */
+#playPauseBtn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    background-color: #222;
+    color: white;
+    cursor: pointer;
+    font-size: 16px;
+    transition: background 0.2s, transform 0.2s;
+}
+#playPauseBtn:hover {
+    background-color: #444;
+    transform: scale(1.05);
 }
 
-/* LG hover glow */
-.fade-plot .scatterlayer .trace .points path:nth-child(2):hover {
-    filter: drop-shadow(0 0 6px #00FFFF); /* LG cyan glow */
+/* Carousel dots */
+#carouselDots {
+    display: flex;
+    justify-content: center;
+    gap: 15px;
+    margin-top: 10px;
+    flex-wrap: wrap; /* wrap if too many APIs */
+}
+
+.dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #555;
+    transition: transform 0.2s, background 0.2s;
+}
+
+.dot.active {
+    background: #00ffff;
+    transform: scale(1.3);
 }
