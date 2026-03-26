@@ -148,6 +148,11 @@ class PPrReg:
 
     LAT_MD1_MD2 = 0x00000085
     LAT_MD3_MD4 = 0x00000086
+    
+    EYE_CONTROL = 0x40007
+    EYE_STATUS  = 0x40009
+    EYE_CONFIG  = 0x40008
+    EYE_READ    = 0x4000A
 
 # ============================================================
 # DBReg
@@ -606,6 +611,121 @@ class PPr:
             self.write(PPrReg.LAT_MD1_MD2, value)
         else:
             self.write(PPrReg.LAT_MD3_MD4, value)
+
+
+    def read_eye(self, verbose=False):
+        # ---------------------------
+        # Registers
+        # ---------------------------
+        reg_control = 0x40007
+        reg_status = 0x40009
+        reg_config = 0x40008
+        reg_read = 0x4000A
+
+        # ---------------------------
+        # Config params
+        # ---------------------------
+        lpm = 1
+        ver = 2
+        hor = 2
+        psc = 1
+        ut = 0
+
+        # ---------------------------
+        # CONFIG
+        # ---------------------------
+        if verbose:
+            print("Writing CONFIG...")
+
+        word = (0 << 31 | ut << 13 | psc << 8 | hor << 4 | ver)
+        self.write(reg_config, word)
+
+        word = (1 << 31 | ut << 13 | psc << 8 | hor << 4 | ver)
+        self.write(reg_config, word)
+
+        # ---------------------------
+        # RESET
+        # ---------------------------
+        if verbose:
+            print("Resetting...")
+        self.write(reg_control, (1 << 31 | 0xF << 27))
+        self.write(reg_control, (1 << 31 | 0 << 27))
+
+        # ---------------------------
+        # START
+        # ---------------------------
+        if verbose:
+            print("Starting...")
+        self.write(reg_control, (1 << 31 | 0xF << 23))
+        self.write(reg_control, (1 << 31 | 0 << 23))
+
+        # ---------------------------
+        # WAIT FOR READY
+        # ---------------------------
+        if verbose:
+            print("Waiting for READY...")
+
+        rdy = 0
+        start_time = time.time()
+        timeout = 10
+
+        while rdy != 0xFFFF:
+            rdy = 0xFFFF & self.read(reg_status)
+            if verbose:
+                print(f"Status: 0x{rdy:04X}")
+
+            if time.time() - start_time > timeout:
+                # print("ERROR: Timeout waiting for READY")
+                break
+
+            time.sleep(0.1)
+
+        # ---------------------------
+        # Prepare eye matrix as nested lists
+        # ---------------------------
+        for rr in range(16):
+            _ = self.read(reg_read + rr)
+
+        n = 4
+        h = (64 // hor + 1) * n
+        v = 127 if ver == 1 else (128 // ver + 1)
+
+        if verbose:
+            print(f"Matrix size: lanes=16, v={v}, h={h}")
+
+        # 3D list: eye[lane][vert][hor]
+        eye = [[[0.0 for _ in range(h)] for _ in range(v)] for _ in range(16)]
+
+        # ---------------------------
+        # Acquisition
+        # ---------------------------
+        if verbose:
+            print("Starting acquisition...")
+
+        for rr in range(16):
+            if verbose:
+                print(f"Lane {rr}")
+
+            for vv in range(v):
+                for hh in range(0, h, n):
+                    aux = self.read(reg_read + rr)
+
+                    sample = aux & 0xFFFF
+                    error = (aux >> 16) & 0xFFFF
+
+                    if sample == 0:
+                        sample = 1
+
+                    value = float(error) / float(2 ** (psc + 1) * sample * 40)
+
+                    for ii in range(n):
+                        eye[rr][vv][hh + ii] = value
+
+        if verbose:
+            print("Eye acquisition done.")
+
+        return eye
+
 
 
 

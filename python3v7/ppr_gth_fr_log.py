@@ -71,40 +71,49 @@ ipbus = IPbus(controlhub_ipaddress, ppr_ipaddress)
 # ==========================================================
 # MAIN LOOP
 # ==========================================================
+last_eye_time = 0  # or time.time() if you want delay before first run
+wait_time = 1
+
 while True:
 
     try:
         
-        all_points = []
+        # now = time.time()
+
+        # # Run eye test every 60 seconds
+        # if now - last_eye_time >= 60:
+        #     all_points = eye_diagram_test(ppr, ppr_label)
+        #     influxdb.write_points(all_points)
+        #     last_eye_time = now
+
+        all_points = eye_diagram_test(ppr, ppr_label)
+        influxdb.write_points(all_points)
+        # last_eye_time = now
+
+        # --- Normal cycle continues ---
         all_points = integrator_lin_test(ppr, feb, ppr_label)
         influxdb.write_points(all_points)
-        time.sleep(10)
-        
-        all_points = []
+        time.sleep(wait_time)
+
         all_points = adc_lin_test(ppr, feb, ppr_label)
         influxdb.write_points(all_points)
-        time.sleep(10)
-        
-        all_points = []
+        time.sleep(wait_time)
+
         all_points = cis_lin_readout(ppr, feb, ppr_label, gain=0)
         influxdb.write_points(all_points)
-        time.sleep(10)
+        time.sleep(wait_time)
 
-        all_points = []
         all_points = cis_test(ppr, feb, ppr_label)
         influxdb.write_points(all_points)
-        time.sleep(10)
-        
-        all_points = []
+        time.sleep(wait_time)
+
         all_points = cis_lin_readout(ppr, feb, ppr_label, gain=1)
         influxdb.write_points(all_points)
-        time.sleep(10)
+        time.sleep(wait_time)
 
-        all_points = []
         all_points = cis_test(ppr, feb, ppr_label)
         influxdb.write_points(all_points)
-        time.sleep(10)
-        
+        time.sleep(wait_time)
 
         
         # time.sleep(60)
