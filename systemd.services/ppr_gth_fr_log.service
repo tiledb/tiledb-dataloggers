@@ -8,7 +8,11 @@ Wants=network-online.target
 User=root
 Group=root
 WorkingDirectory=/root/apps/tiledb-dataloggers/python3v7
-ExecStart=/root/apps/tiledb-dataloggers/python3v7/.pyenv/bin/python ppr_gth_fr_log.py
+ExecStart=/root/apps/tiledb-dataloggers/python3v7/.pyenv/bin/python \
+    ppr_gth_fr_log.py \
+    --ppr-label PprGTH \
+    --controlhub-ip 192.168.0.201 \
+    --ppr-ip 192.168.0.2
 Restart=always
 RestartSec=5
 

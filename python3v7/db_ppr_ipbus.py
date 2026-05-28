@@ -173,7 +173,7 @@ class DBReg:
     FPGA = [1, 3, 1, 3, 1, 3, 0, 2, 0, 2, 0, 2]
     FPGA_CHANNEL = [2, 2, 1, 1, 0, 0, 2, 2, 1, 1, 0, 0]
     ADC_MAP = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-
+    INTEGRATOR_ADC_MAP = [4, 5, 2, 3, 0, 1, 10, 11, 8, 9, 6, 7]
     CMD_BIT_E_MASK = 0x400000
     CMD_BIT_E_OFFSET = 22
     CMD_BIT_B_MASK = 0x200000
@@ -549,7 +549,7 @@ class PPr:
         while dead_beef:
             # Read from integrator FIFO
             integrator_value = self.read(
-                PPrReg.INTEGRATOR_SLOW_READOUT + (DBReg.ADC_MAP[adc] + offset),
+                PPrReg.INTEGRATOR_SLOW_READOUT + (DBReg.INTEGRATOR_ADC_MAP[adc] + offset),
                 size=samples
             )
 
@@ -667,7 +667,7 @@ class PPr:
 
         rdy = 0
         start_time = time.time()
-        timeout = 10
+        timeout = 20
 
         while rdy != 0xFFFF:
             rdy = 0xFFFF & self.read(reg_status)
@@ -675,7 +675,8 @@ class PPr:
                 print(f"Status: 0x{rdy:04X}")
 
             if time.time() - start_time > timeout:
-                # print("ERROR: Timeout waiting for READY")
+                if verbose:
+                    print("ERROR: Timeout waiting for READY")
                 break
 
             time.sleep(0.1)

@@ -159,17 +159,17 @@ def adc_lin_test(ppr, feb, ppr_label):
     # ------------------ CONFIG PHASE -------------------
 
     # print("Setting TTC internal... ", end="")
-    ret = ppr.set_global_TTC_internal()
+    ppr.set_global_TTC_internal()
     # print("Ok" if ret else "Failed")
 
     # print("Resetting CRC counters... ", end="")
-    ret = ppr.reset_integrator_fifo()  # or implement reset_CRC_counters()
+    ppr.reset_integrator_fifo()  # or implement reset_CRC_counters()
     # print("Ok" if ret else "Failed")
 
     # print("Setting PPr enable deadtime bit in Global Trigger Conf...")
-    ret = ppr.set_global_trigger_deadtime(0)
+    ppr.set_global_trigger_deadtime(0)
     # print(f"  set bit to 0: {'Ok' if ret else 'Fail'}")
-    ret = ppr.set_global_trigger_deadtime(1)
+    ppr.set_global_trigger_deadtime(1)
     # print(f"  set bit to 1: {'Ok' if ret else 'Fail'}")
 
     for md in range(firstMD, firstMD + nMD):
