@@ -72,11 +72,19 @@ parser.add_argument(
     help="PPr IP address"
 )
 
+parser.add_argument(
+    "--benchtest",
+    action="store_true",
+    help="Enable MariaDB benchtest polling and InfluxDB Bench Test logging"
+)
+
 args = parser.parse_args()
 
 ppr_label = args.ppr_label
 controlhub_ipaddress = args.controlhub_ip
 ppr_ipaddress = args.ppr_ip
+benchtest_enabled = args.benchtest
+
 
 # ============================================================
 # CONNECTION FUNCTION
@@ -170,7 +178,9 @@ def connect_mariadb():
 
                 connect_timeout=10,
                 read_timeout=30,
-                write_timeout=30
+                write_timeout=30,
+                autocommit=True
+
             )
 
             print("Connected to MariaDB")
@@ -257,7 +267,10 @@ def get_active_bench_tests():
 
 ppr = connect_ppr()
 
-mariadb = connect_mariadb()
+if benchtest_enabled:
+    mariadb = connect_mariadb()
+else:
+    mariadb = None
 
 # ============================================================
 # INIT VARIABLES
@@ -884,51 +897,53 @@ while True:
         # ACTIVE BENCH TEST LOGGING
         # ------------------------------------------------
 
-        active_tests = get_active_bench_tests()
+        if benchtest_enabled:
 
-        if active_tests is not None:
-            for test in active_tests:
-                
-                all_points.append({
+            active_tests = get_active_bench_tests()
 
-                    "measurement": "Bench Test",
+            if active_tests is not None:
+                for test in active_tests:
 
-                    "fields": {
+                    all_points.append({
 
-                        "id":
-                            int(test["id"]),
+                        "measurement": "Bench Test",
 
-                        "test_op":
-                            str(test["test_op"])
-                            if test["test_op"] is not None
-                            else "",
+                        "fields": {
 
-                        "test_pass":
-                            int(test["test_pass"])
-                            if test["test_pass"] is not None
-                            else 0,
+                            "id":
+                                int(test["id"]),
 
-                        "db_slot1":
-                            int(test["db_slot1"])
-                            if test["db_slot1"] is not None
-                            else 0,
+                            "test_op":
+                                str(test["test_op"])
+                                if test["test_op"] is not None
+                                else "",
 
-                        "db_slot2":
-                            int(test["db_slot2"])
-                            if test["db_slot2"] is not None
-                            else 0,
+                            "test_pass":
+                                int(test["test_pass"])
+                                if test["test_pass"] is not None
+                                else 0,
 
-                        "db_slot3":
-                            int(test["db_slot3"])
-                            if test["db_slot3"] is not None
-                            else 0,
+                            "db_slot1":
+                                int(test["db_slot1"])
+                                if test["db_slot1"] is not None
+                                else 0,
 
-                        "db_slot4":
-                            int(test["db_slot4"])
-                            if test["db_slot4"] is not None
-                            else 0
-                    }
-                })
+                            "db_slot2":
+                                int(test["db_slot2"])
+                                if test["db_slot2"] is not None
+                                else 0,
+
+                            "db_slot3":
+                                int(test["db_slot3"])
+                                if test["db_slot3"] is not None
+                                else 0,
+
+                            "db_slot4":
+                                int(test["db_slot4"])
+                                if test["db_slot4"] is not None
+                                else 0
+                        }
+                    })
 
         # ----------------------------------------------------
         # RECONNECT IF NEEDED
