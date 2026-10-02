@@ -1,0 +1,26 @@
+[Unit]
+Description=PPrGTH_FR_Log (python3v11)
+After=network-online.target
+Wants=network-online.target
+
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/root/apps/tiledb-dataloggers/python3v11
+ExecStart=/root/apps/tiledb-dataloggers/python3v11/.pyenv/bin/python \
+    ppr_gth_fr_log.py \
+    --ppr-label PprGTH \
+    --controlhub-ip 192.168.0.201 \
+    --ppr-ip 192.168.0.2
+Restart=always
+RestartSec=5
+
+# Optional but recommended
+Environment="PYTHONUNBUFFERED=1"
+Environment="VIRTUAL_ENV=/root/apps/tiledb-dataloggers/python3v11/.pyenv"
+Environment="PATH=/root/apps/tiledb-dataloggers/python3v11/.pyenv/bin:/usr/bin"
+Environment="LD_LIBRARY_PATH=/usr/local/lib"
+
+[Install]
+WantedBy=multi-user.target

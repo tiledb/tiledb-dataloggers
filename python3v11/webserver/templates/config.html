@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Configuration</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+
+<body class="p-4">
+
+    <h2>Configuration Editor</h2>
+    <a href="/" class="btn btn-secondary mb-3">Back</a>
+
+    <form method="POST">
+
+        <h4>Feature Toggles</h4>
+        <div class="form-check">
+            <input class="form-check-input" type="checkbox" name="api_enabled" {% if
+                config["features"].getboolean("api_enabled") %}checked{% endif %}>
+            <label class="form-check-label">API Enabled</label>
+        </div>
+
+        <div class="form-check">
+            <input class="form-check-input" type="checkbox" name="live_logs" {% if
+                config["features"].getboolean("live_logs") %}checked{% endif %}>
+            <label class="form-check-label">Live Logs</label>
+        </div>
+
+        <div class="form-check">
+            <input class="form-check-input" type="checkbox" name="auto_refresh" {% if
+                config["features"].getboolean("auto_refresh") %}checked{% endif %}>
+            <label class="form-check-label">Auto Refresh</label>
+        </div>
+
+        <div class="form-check">
+            <input class="form-check-input" type="checkbox" name="system_monitoring" {% if
+                config["features"].getboolean("system_monitoring") %}checked{% endif %}>
+            <label class="form-check-label">System Monitoring</label>
+        </div>
+
+        <hr>
+
+        <h4>Users (username = password,role)</h4>
+        <textarea class="form-control" name="users" rows="5">{% for user in config["users"] %}
+{{ user }} = {{ config["users"][user] }}
+{% endfor %}</textarea>
+
+        <hr>
+
+        <h4>Servers</h4>
+        <textarea class="form-control" name="servers" rows="4">{% for srv in config["servers"] %}
+{{ srv }} = {{ config["servers"][srv] }}
+{% endfor %}</textarea>
+
+        <hr>
+
+        <h4>Service Groups</h4>
+        <textarea class="form-control" name="services" rows="8">{% for group in config["services"] %}
+{{ group }} =
+{% for s in config["services"][group].splitlines() %}
+    {{ s }}
+{% endfor %}
+{% endfor %}</textarea>
+
+        <hr>
+
+        <h4>Permissions</h4>
+        <textarea class="form-control" name="permissions" rows="4">{% for role in config["permissions"] %}
+{{ role }} = {{ config["permissions"][role] }}
+{% endfor %}</textarea>
+
+        <br>
+        <button class="btn btn-success">Save Configuration</button>
+
+    </form>
+
+</body>
+
+</html>
