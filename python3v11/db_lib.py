@@ -310,7 +310,7 @@ lut_xadc_fg_dimensions= [
 lut_cfgbus_address = [
 0x000,
 0x001,
-0x0F0,
+0x002,  # cfb_mb_phase_config (was wrongly 0x0F0; FW/plugin use 0x002)
 0x121,
 0x004,
 0x115,

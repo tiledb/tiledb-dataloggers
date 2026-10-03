@@ -8,6 +8,7 @@ import math
 import numpy as np  # still needed for averaging stats
 from ppr_gth_fr_functions import *
 from db_ppr_ipbus import PPr, FEB, PPrReg
+from db_lib import cfb_mb_phase_config, lut_cfgbus_address
 
 from itertools import groupby
 from scipy.special import erfc
@@ -125,6 +126,19 @@ def analyze_pulse(samples,
     return pedestal, peak_value, peak_index, center_of_mass, fwhm
 
 
+def arm_pipeline_deadtime(ppr):
+    """Enable RO_GLOBAL_TRIGGER bit 3 so an L1A snapshot stays frozen for IPbus."""
+    ppr.set_global_trigger_deadtime(0)
+    ppr.set_global_trigger_deadtime(1)
+
+
+def trigger_pipeline_readout(ppr, feb, bcid_l1a, settle_s=0.02):
+    """Latch PPr pipelines: release busy, send L1A, settle (plugin trigger_readout)."""
+    ppr.read(PPrReg.LAST_EVT_BCID)
+    ppr.read(PPrReg.LAST_EVT_L1ID)
+    feb.send_L1A(int(bcid_l1a) & 0xFFF, 3)
+    time.sleep(settle_s)
+
 
 def adc_lin_test(ppr, feb, ppr_label):
     bcid_l1a = 3200
@@ -165,10 +179,7 @@ def adc_lin_test(ppr, feb, ppr_label):
     # print("Ok" if ret else "Failed")
 
     # print("Setting PPr enable deadtime bit in Global Trigger Conf...")
-    ppr.set_global_trigger_deadtime(0)
-    # print(f"  set bit to 0: {'Ok' if ret else 'Fail'}")
-    ppr.set_global_trigger_deadtime(1)
-    # print(f"  set bit to 1: {'Ok' if ret else 'Fail'}")
+    arm_pipeline_deadtime(ppr)
 
     for md in range(firstMD, firstMD + nMD):
         VinDACs = feb.convert_ped_ADC_to_DACs(0)
@@ -184,9 +195,7 @@ def adc_lin_test(ppr, feb, ppr_label):
             feb.load_ped_LG(md, dbside, feb_id)
 
     time.sleep(0.01)  # small delay to ensure settings are applied
-    feb.send_L1A(bcid_l1a, 3)
-    last_L1ID = ppr.read(PPrReg.LAST_EVT_L1ID)
-    last_BCID = ppr.read(PPrReg.LAST_EVT_BCID)
+    trigger_pipeline_readout(ppr, feb, bcid_l1a)
     time.sleep(0.1)  # small delay to ensure settings are applied
 
     for step in range(nsteps):
@@ -219,15 +228,7 @@ def adc_lin_test(ppr, feb, ppr_label):
             # ---- Loop over events per step ----
             time.sleep(0.02)  # small delay to ensure settings are applied
             for event in range(step_events):
-                # Reads last Event BCID (disables busy to read pipelines).
-                # LastEvtBCID = ppr.get_counter_last_event_BCID()
-
-                # Reads last Event L1ID (disables busy to read pipelines).
-                # LastEvtL1ID = ppr.get_counter_last_event_L1ID()
-                # print(f"  Step {step} Event {event}: Sent L1A with BCID={bcid_l1a}, LastEvtBCID={LastEvtBCID}")
-
-                # Send L1A trigger
-                feb.send_L1A(bcid_l1a, 3)
+                trigger_pipeline_readout(ppr, feb, bcid_l1a)
 
                 # Read pipeline data for selected MDs
                 if step>0:
@@ -253,11 +254,6 @@ def adc_lin_test(ppr, feb, ppr_label):
                         # print(f"  Step {step} Event {event}: MD{md} ADC{adc} HG avg={sum(hg_data)/len(hg_data):.2f} LG avg={sum(lg_data)/len(lg_data):.2f}")
                         # print(f"  Step {step} Event {event}: MD{md} ADC{adc} ADCped {ADCped} HG mean={hg_mean:.2f} LG mean={lg_mean:.2f}")
 
-                # Print last event IDs for monitoring
-                last_L1ID = ppr.read(PPrReg.LAST_EVT_L1ID)
-                last_BCID = ppr.read(PPrReg.LAST_EVT_BCID)
-                # print(f"Step {step} done. Last L1ID={last_L1ID}, BCID={last_BCID}")
-
 
     for md in range(firstMD, firstMD + nMD):
         VinDACs = feb.convert_ped_ADC_to_DACs(0)
@@ -273,9 +269,7 @@ def adc_lin_test(ppr, feb, ppr_label):
             feb.load_ped_LG(md, dbside, feb_id)
 
     time.sleep(0.01)  # small delay to ensure settings are applied
-    feb.send_L1A(bcid_l1a, 3)
-    last_L1ID = ppr.read(PPrReg.LAST_EVT_L1ID)
-    last_BCID = ppr.read(PPrReg.LAST_EVT_BCID)
+    trigger_pipeline_readout(ppr, feb, bcid_l1a)
     time.sleep(0.1)  # small delay to ensure settings are applied
 
     all_points = []
@@ -352,47 +346,53 @@ def adc_lin_test(ppr, feb, ppr_label):
     return all_points
 
 
+def read_md_pulse_metrics(ppr, md, nsamp, nchanperMD):
+    """Read HG/LG pipelines for one MD and return pulse metrics (no L1A)."""
+    hg_peaks_step = []
+    lg_peaks_step = []
+    hg_centers_step = []
+    lg_centers_step = []
+    hg_fwhm_step = []
+    lg_fwhm_step = []
+    hg_pedestal_step = []
+    lg_pedestal_step = []
+
+    for adc in range(nchanperMD):
+        hg_data = ppr.get_data_HG(md, adc, nsamp)
+        lg_data = ppr.get_data_LG(md, adc, nsamp)
+
+        hg_ped, hg_peak, hg_idx, hg_center, hg_width = analyze_pulse(hg_data)
+        lg_ped, lg_peak, lg_idx, lg_center, lg_width = analyze_pulse(lg_data)
+
+        hg_peaks_step.append(hg_peak)
+        lg_peaks_step.append(lg_peak)
+        hg_centers_step.append(hg_center)
+        lg_centers_step.append(lg_center)
+        hg_fwhm_step.append(hg_width)
+        lg_fwhm_step.append(lg_width)
+        hg_pedestal_step.append(hg_ped)
+        lg_pedestal_step.append(lg_ped)
+
+    return (hg_peaks_step, lg_peaks_step, hg_centers_step, lg_centers_step,
+            hg_fwhm_step, lg_fwhm_step, hg_pedestal_step, lg_pedestal_step)
+
+
 def read_md_data_with_retry(ppr, feb, md, nsamp, nchanperMD, bcid_l1a, previous_hg_peaks=None, previous_lg_peaks=None,
-                            threshold=0.9, max_retries=3):
+                            threshold=0.9, max_retries=3, trigger=True):
     """
     Reads all channels of an MD, retries if any peak is below threshold*previous_peak.
+    When trigger=True, each attempt uses plugin-style LAST_EVT → L1A → settle.
     Returns:
         hg_peaks, lg_peaks, hg_centers, lg_centers, hg_fwhm, lg_fwhm, hg_pedestal, lg_pedestal
     """
     retry = 0
     while retry <= max_retries:
-        hg_peaks_step = []
-        lg_peaks_step = []
-        hg_centers_step = []
-        lg_centers_step = []
-        hg_fwhm_step = []
-        lg_fwhm_step = []
-        hg_pedestal_step = []
-        lg_pedestal_step = []
+        if trigger:
+            trigger_pipeline_readout(ppr, feb, bcid_l1a)
 
-        # Send L1A before readout
-        feb.send_L1A(bcid_l1a, 3)
-        time.sleep(0.05)
-
-        for adc in range(nchanperMD):
-            hg_data = ppr.get_data_HG(md, adc, nsamp)
-            lg_data = ppr.get_data_LG(md, adc, nsamp)
-
-            hg_ped, hg_peak, hg_idx, hg_center, hg_width = analyze_pulse(hg_data)
-            lg_ped, lg_peak, lg_idx, lg_center, lg_width = analyze_pulse(lg_data)
-
-            hg_peaks_step.append(hg_peak)
-            lg_peaks_step.append(lg_peak)
-            hg_centers_step.append(hg_center)
-            lg_centers_step.append(lg_center)
-            hg_fwhm_step.append(hg_width)
-            lg_fwhm_step.append(lg_width)
-            hg_pedestal_step.append(hg_ped)
-            lg_pedestal_step.append(lg_ped)
-
-        # Read last L1ID and BCID
-        last_L1ID = ppr.read(PPrReg.LAST_EVT_L1ID)
-        last_BCID = ppr.read(PPrReg.LAST_EVT_BCID)
+        (hg_peaks_step, lg_peaks_step, hg_centers_step, lg_centers_step,
+         hg_fwhm_step, lg_fwhm_step, hg_pedestal_step, lg_pedestal_step) = \
+            read_md_pulse_metrics(ppr, md, nsamp, nchanperMD)
 
         # Check if retry is needed
         retry_needed = False
@@ -410,6 +410,8 @@ def read_md_data_with_retry(ppr, feb, md, nsamp, nchanperMD, bcid_l1a, previous_
             retry += 1
             # print(f"MD{md} retry {retry}/{max_retries} due to low peak(s)...")
             time.sleep(0.05)
+            # Retries always re-trigger so a fresh snapshot is latched
+            trigger = True
 
     # If still failing after max_retries, return last readout anyway
     # print(f"MD{md} reached max retries ({max_retries}), returning last readout")
@@ -482,13 +484,7 @@ def cis_test(ppr, feb, ppr_label):
     # print("=" * 40)
     # print(f"{'Totals:':<6}{str(initial_crc_sideA):<15}{str(initial_crc_sideB):<15}")
 
-    # print("Setting PPr enable deadtime bit in Global Trigger Conf...")
-    # ret = ppr.set_global_trigger_deadtime(0)
-    # print(f"  set bit to 0: {'Ok' if ret else 'Fail'}")
-    # ret = ppr.set_global_trigger_deadtime(1)
-    # print(f"  set bit to 1: {'Ok' if ret else 'Fail'}")
-
-
+    arm_pipeline_deadtime(ppr)
 
     # ------------------ CIS TEST -------------------
 
@@ -534,8 +530,7 @@ def cis_test(ppr, feb, ppr_label):
     step_x = [int(i) for i in range(nsamp)]
 
     for event in range(n_events):
-        # Send L1A trigger
-        feb.send_L1A(bcid_l1a, 3)
+        trigger_pipeline_readout(ppr, feb, bcid_l1a)
         for md in range(firstMD, firstMD + nMD):
             for adc in range(nchanperMD):
                 # Read ADC pipeline data
@@ -546,9 +541,6 @@ def cis_test(ppr, feb, ppr_label):
                 all_lg_data[md * nchanperMD + adc].extend(lg_data)
 
                 # print(f"MD{md} ADC{adc} HG data={hg_data} LG data={lg_data}")
-
-        last_L1ID = ppr.read(PPrReg.LAST_EVT_L1ID)
-        last_BCID = ppr.read(PPrReg.LAST_EVT_BCID)
 
     # ------------------ ASCII PLOTS -------------------
     # print(all_hg_data)
@@ -701,6 +693,110 @@ def cis_test(ppr, feb, ppr_label):
     return all_points
 
 
+def cis_phase_scan(ppr, feb, ipbus, ppr_label):
+    """CIS pulse phase scan via cfb_mb_phase_config (32 steps / 25 ns).
+
+    Runs LG capacitor then HG capacitor; records only the matching gain
+    pipeline into CIS_Phase_Scan_Samples.
+    """
+    all_points = []
+    dbside = 0
+    nsamp = 16
+    nchanperMD = 12
+    nMD = 4
+    firstMD = 0
+    n_events = 1
+
+    bcid_l1a = 2246
+    BCID_charge = 500
+    BCID_discharge = 2200
+    ADCped = 200
+    DACcharge = 3500
+
+    # HW addr must be 0x002 (enum index == address). Do not trust a stale lut 0x0F0.
+    phase_hw = int(lut_cfgbus_address[cfb_mb_phase_config]) & 0xFFFF
+    if phase_hw != 0x002:
+        phase_hw = 0x002
+    phases = range(32)
+    # capacitor bit 0=LG (TPL), 1=HG (TPH); record matching gain only
+    capacitor_runs = ((0, "LG"), (1, "HG"))
+
+    ppr.set_global_TTC_internal()
+    arm_pipeline_deadtime(ppr)
+
+    DACbiasP, DACbiasN = feb.convert_ped_ADC_to_DACs(ADCped)
+
+    for capacitor, gain_tag in capacitor_runs:
+        for md in range(firstMD, firstMD + nMD):
+            for feb_id in range(nchanperMD):
+                feb.set_ped_HG_pos(md, dbside, feb_id, DACbiasP)
+                feb.set_ped_HG_neg(md, dbside, feb_id, DACbiasN)
+                feb.set_ped_LG_pos(md, dbside, feb_id, DACbiasP)
+                feb.set_ped_LG_neg(md, dbside, feb_id, DACbiasN)
+                feb.load_ped_HG(md, dbside, feb_id)
+                feb.load_ped_LG(md, dbside, feb_id)
+
+        for md in range(firstMD, firstMD + nMD):
+            for adc in range(nchanperMD):
+                feb.set_switches_noise(md, dbside=2, feb=adc)
+
+        for md in range(firstMD, firstMD + nMD):
+            for feb_id in range(nchanperMD):
+                feb.set_CIS_BCID_settings(
+                    md, dbside, BCID_charge, BCID_discharge, capacitor
+                )
+
+        for md in range(firstMD, firstMD + nMD):
+            for feb_id in range(nchanperMD):
+                feb.set_CIS_DAC(md, dbside, feb_id, DACcharge)
+
+        time.sleep(0.05)
+
+        now = datetime.datetime.utcnow().isoformat()
+
+        for phase in phases:
+            p = int(phase) & 0x1F
+            word = (p << 23) | (p << 7)
+            for md in range(firstMD, firstMD + nMD):
+                ipbus.DB_Write_Val(md, 0b10, phase_hw, word)
+                ipbus.DB_Write_Val(md, 0b11, phase_hw, word)
+            time.sleep(0.02)
+
+            for event in range(n_events):
+                trigger_pipeline_readout(ppr, feb, bcid_l1a)
+
+                for md in range(firstMD, firstMD + nMD):
+                    for adc in range(nchanperMD):
+                        if capacitor == 0:
+                            samples = ppr.get_data_LG(md, adc, nsamp)
+                        else:
+                            samples = ppr.get_data_HG(md, adc, nsamp)
+
+                        channel = f"{ppr_label}_MD{md+1}_CH{adc}"
+                        for sample_idx, value in enumerate(samples):
+                            all_points.append({
+                                "measurement": "CIS_Phase_Scan_Samples",
+                                "tags": {
+                                    "channel": channel,
+                                    "gain": gain_tag,
+                                    "event": str(event),
+                                    "sample": sample_idx,
+                                    "phase-31": str(phase),
+                                },
+                                "time": now,
+                                "fields": {
+                                    "value": float(value),
+                                },
+                            })
+
+    # Reset phase so subsequent cycle tests are not left at phase 31
+    for md in range(firstMD, firstMD + nMD):
+        ipbus.DB_Write_Val(md, 0b10, phase_hw, 0)
+        ipbus.DB_Write_Val(md, 0b11, phase_hw, 0)
+
+    return all_points
+
+
 def cis_lin_readout(ppr, feb, ppr_label, gain=0):
     all_points = []
     
@@ -757,6 +853,7 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
     # ------------------ CONFIG PHASE -------------------
 
     ppr.set_global_TTC_internal()
+    arm_pipeline_deadtime(ppr)
     DACbiasP, DACbiasN = feb.convert_ped_ADC_to_DACs(ADCped)
 
     for md in range(firstMD, firstMD + nMD):
@@ -803,8 +900,8 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
         lg_pedestal_step = []
 
         for event in range(n_events):
-            feb.send_L1A(bcid_l1a, 3)
-            time.sleep(0.05)
+            # One L1A latches all MDs; per-MD retries re-trigger only if needed
+            trigger_pipeline_readout(ppr, feb, bcid_l1a)
 
             for md in range(firstMD, firstMD + nMD):
                 previous_hg = all_hg_peaks[-1][md*nchanperMD:(md+1)*nchanperMD] if step>0 else None
@@ -815,7 +912,8 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
                     read_md_data_with_retry(ppr, feb, md, nsamp, nchanperMD, bcid_l1a,
                                             previous_hg_peaks=previous_hg,
                                             previous_lg_peaks=previous_lg,
-                                            threshold=0.9, max_retries=0)
+                                            threshold=0.9, max_retries=0,
+                                            trigger=False)
 
                 # Append MD data
                 hg_peaks_step.extend(hg_peaks_step_md)
@@ -826,10 +924,6 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
                 lg_fwhm_step.extend(lg_fwhm_step_md)
                 hg_pedestal_step.extend(hg_pedestal_step_md)
                 lg_pedestal_step.extend(lg_pedestal_step_md)
-
-
-            last_L1ID = ppr.read(PPrReg.LAST_EVT_L1ID)
-            last_BCID = ppr.read(PPrReg.LAST_EVT_BCID)
 
         all_hg_peaks.append(hg_peaks_step)
         all_lg_peaks.append(lg_peaks_step)

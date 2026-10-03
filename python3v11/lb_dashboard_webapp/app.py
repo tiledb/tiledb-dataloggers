@@ -1,11 +1,257 @@
 import math
-from flask import Flask, render_template, jsonify
+import time
+import json
+from zoneinfo import ZoneInfo
+from flask import Flask, render_template, jsonify, Response
 from influxdb import InfluxDBClient
 import pandas as pd
 import plotly.graph_objs as go
 from plotly.subplots import make_subplots
-import json
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+_API_CACHE = {}
+_CACHE_TTL_SEC = 15.0
+STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
+
+
+# -------------------------
+# Timestamp / cache / serialize helpers
+# -------------------------
+def _to_utc_timestamp(ts):
+    """Parse Influx time to UTC pandas Timestamp, or None if invalid/epoch."""
+    if ts is None or (isinstance(ts, float) and math.isnan(ts)):
+        return None
+    try:
+        dt = pd.to_datetime(ts, utc=True)
+        if pd.isna(dt):
+            return None
+        # Influx multi-field last() often returns epoch 0 — treat as missing
+        if dt.timestamp() <= 0 or dt.year <= 1970:
+            return None
+        return dt
+    except Exception:
+        return None
+
+
+def format_data_timestamp(ts):
+    """Format Influx UTC timestamp as Stockholm local YYYY/MM/DD HH:MM:SS."""
+    dt = _to_utc_timestamp(ts)
+    if dt is None:
+        return None
+    return dt.tz_convert(STOCKHOLM_TZ).strftime("%Y/%m/%d %H:%M:%S")
+
+
+def max_timestamp(values):
+    """Latest formatted Stockholm timestamp from DataFrames and/or raw times."""
+    latest = None
+    for item in values:
+        candidates = []
+        if item is None:
+            continue
+        if hasattr(item, "empty"):
+            if item.empty or "time" not in item.columns:
+                continue
+            candidates = item["time"].dropna().unique()
+        else:
+            candidates = [item]
+        for t in candidates:
+            dt = _to_utc_timestamp(t)
+            if dt is None:
+                continue
+            if latest is None or dt > _to_utc_timestamp(latest):
+                latest = t
+    return format_data_timestamp(latest)
+
+
+def slide_timestamp_info(*sources, labels=None):
+    """
+    Pick display timestamp and warn if sources disagree.
+
+    sources: DataFrames (with time col) and/or raw Influx time values
+    labels: optional names (e.g. HG / LG) aligned with sources
+    Returns (stockholm_display_ts, warning_or_None)
+    """
+    collected = []  # (label, raw_ts, utc_dt)
+
+    for i, src in enumerate(sources):
+        lab = labels[i] if labels and i < len(labels) else f"src{i}"
+        if src is None:
+            continue
+        if hasattr(src, "empty"):
+            if getattr(src, "empty", True) or "time" not in getattr(src, "columns", []):
+                continue
+            for t in src["time"].dropna().unique():
+                dt = _to_utc_timestamp(t)
+                if dt is not None:
+                    collected.append((lab, t, dt))
+        else:
+            dt = _to_utc_timestamp(src)
+            if dt is not None:
+                collected.append((lab, src, dt))
+
+    if not collected:
+        return None, None
+
+    by_key = {}
+    for lab, raw, dt in collected:
+        key = dt.isoformat()
+        slot = by_key.setdefault(key, {"labels": set(), "raw": raw, "dt": dt})
+        slot["labels"].add(lab)
+
+    latest_raw = max(collected, key=lambda x: x[2])[1]
+    display = format_data_timestamp(latest_raw)
+
+    if len(by_key) <= 1:
+        return display, None
+
+    parts = []
+    for key in sorted(by_key.keys()):
+        info = by_key[key]
+        labs = ",".join(sorted(info["labels"]))
+        parts.append(f"{labs}={format_data_timestamp(info['raw'])}")
+
+    warning = "Timestamp mismatch: " + "; ".join(parts)
+    return display, warning
+
+
+def cache_get(key):
+    hit = _API_CACHE.get(key)
+    if not hit:
+        return None
+    expires, body = hit
+    if time.monotonic() > expires:
+        _API_CACHE.pop(key, None)
+        return None
+    return body
+
+
+def cache_set(key, body, ttl=_CACHE_TTL_SEC):
+    _API_CACHE[key] = (time.monotonic() + ttl, body)
+
+
+def fig_to_jsonable(fig):
+    """Serialize Plotly figure using plain JSON lists (no binary bdata)."""
+    for tr in fig.data:
+        for attr in ("x", "y"):
+            val = getattr(tr, attr, None)
+            if val is None:
+                continue
+            if hasattr(val, "tolist"):
+                setattr(tr, attr, val.tolist())
+            elif not isinstance(val, list):
+                setattr(tr, attr, list(val))
+    # engine=json avoids orjson binary packing (plain arrays, smaller CPU)
+    return json.loads(fig.to_json(engine="json"))
+
+
+def latest_batch_time(measurement, where_sql=""):
+    """Timestamp of the newest point (single-field last — avoids epoch-0 bug)."""
+    where = f"WHERE {where_sql}" if where_sql else ""
+    query = f'SELECT last("value") FROM "{measurement}" {where}'
+    try:
+        result = client.query(query)
+        for p in result.get_points():
+            t = p.get("time")
+            if format_data_timestamp(t) is not None:
+                return t
+    except Exception as e:
+        print(f"BATCH TIME ERROR ({measurement}):", e)
+    return None
+
+
+def map_query(fn, items):
+    """Apply fn over items (sequential — shared Influx client is not thread-safe)."""
+    return [fn(x) for x in items]
+
+
+def apply_md_layout(fig, md_label, n_channels=12, x_range=None, y_range=None,
+                    show_hg_lg_legend=True):
+    """Shared layout: tight fit, channel titles, outer ticks, dark theme."""
+    title_text = md_label
+    if show_hg_lg_legend:
+        title_text = (
+            f"{md_label}"
+            f"<span style='font-size:10px; color:#aaa'>"
+            f"&nbsp;&nbsp;<span style='color:#FF4444'>● HG</span>"
+            f"&nbsp;<span style='color:#00E5FF'>● LG</span></span>"
+        )
+
+    fig.update_layout(
+        autosize=True,
+        height=None,
+        width=None,
+        showlegend=False,
+        title=dict(
+            text=title_text,
+            x=0.5,
+            xanchor="center",
+            font=dict(size=13, color="white"),
+            pad=dict(t=0, b=0),
+        ),
+        margin=dict(l=28, r=6, t=32, b=20),
+        plot_bgcolor="#111111",
+        paper_bgcolor="#111111",
+        font=dict(color="white", size=9),
+        hovermode="closest",
+    )
+
+    # Keep subplot titles readable; do not restyle paper/title annotations
+    for ann in fig.layout.annotations:
+        if getattr(ann, "text", None) and str(ann.text).startswith("CH"):
+            ann.font = dict(size=10, color="#cccccc")
+
+    # Outer-edge ticks only (scale without clutter)
+    for i in range(n_channels):
+        row = i // 6 + 1
+        col = i % 6 + 1
+        x_kwargs = dict(
+            showticklabels=(row == 2),
+            ticks="outside" if row == 2 else "",
+            tickfont=dict(size=8, color="#aaaaaa"),
+            showgrid=True,
+            gridcolor="#333333",
+            zeroline=False,
+            row=row,
+            col=col,
+        )
+        if x_range is not None:
+            x_kwargs["range"] = x_range
+        fig.update_xaxes(**x_kwargs)
+
+        y_kwargs = dict(
+            showticklabels=(col == 1),
+            ticks="outside" if col == 1 else "",
+            tickfont=dict(size=8, color="#aaaaaa"),
+            showgrid=True,
+            gridcolor="#333333",
+            zeroline=False,
+            row=row,
+            col=col,
+        )
+        if y_range is not None:
+            y_kwargs["range"] = y_range
+        fig.update_yaxes(**y_kwargs)
+
+    return fig
+
+
+def add_subplot_metric(fig, row, col, text):
+    """Compact metric label inside a subplot (top-left)."""
+    fig.add_annotation(
+        text=text,
+        x=0.03,
+        y=0.97,
+        xref="x domain",
+        yref="y domain",
+        xanchor="left",
+        yanchor="top",
+        showarrow=False,
+        font=dict(size=8, color="#dddddd"),
+        bgcolor="rgba(0,0,0,0.45)",
+        borderpad=2,
+        row=row,
+        col=col,
+    )
 
 # -------------------------
 # Linear fit function
@@ -105,27 +351,31 @@ client = InfluxDBClient(
     database=influx_conf["database"]
 )
 
+
 # -------------------------
 # Query ADC linearity samples
 # -------------------------
 
 def query_adc_lin_samples(gain):
+    """Latest ADC linearity batch for one gain (exact-time read, not full-history last())."""
+    ts = latest_batch_time("ADC_Linearity_Samples", f"\"gain\"='{gain}'")
+    if ts is None:
+        return pd.DataFrame(), None
+
     query = f"""
-    SELECT last("value") AS value, last("std") AS std, last("adc_input") AS adc_input
+    SELECT "value","std","adc_input"
     FROM "ADC_Linearity_Samples"
-    WHERE "gain"='{gain}'
+    WHERE "gain"='{gain}' AND time = '{ts}'
     GROUP BY "channel","gain","step"
     """
     result = client.query(query)
     rows = []
 
-    for (measurement, tags), points in result.items():
+    for (_, tags), points in result.items():
         if tags is None:
             continue
-
         channel = tags.get("channel")
         step = int(tags.get("step"))
-
         for p in points:
             rows.append({
                 "channel": channel,
@@ -133,50 +383,48 @@ def query_adc_lin_samples(gain):
                 "step": step,
                 "adc_input": p["adc_input"],
                 "value": p["value"],
-                "std": p["std"]
+                "std": p.get("std", 0) or 0,
+                "time": ts,
             })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), ts
 
 
 # -------------------------
 # Query CIS samples
 # -------------------------
 def query_cis_samples(gain):
-    query = f"""
-    SELECT last("value") AS value
-    FROM "CIS_Samples"
-    WHERE "gain"='{gain}'
-    GROUP BY "channel","sample","event"
-    """
+    """Latest CIS sample batch for one gain."""
+    ts = latest_batch_time("CIS_Samples", f"\"gain\"='{gain}'")
+    if ts is None:
+        return pd.DataFrame(), None
 
+    # Logger uses event=0 for the live CIS pulse; skip event cardinality in GROUP BY
+    query = f"""
+    SELECT "value"
+    FROM "CIS_Samples"
+    WHERE "gain"='{gain}' AND time = '{ts}' AND "event"='0'
+    GROUP BY "channel","sample"
+    """
     result = client.query(query)
     all_points = []
 
-    for (measurement, tags), points in result.items():
+    for (_, tags), points in result.items():
         if tags is None:
             continue
-
         channel = tags.get("channel")
         sample = int(tags.get("sample", 0))
-        event = int(tags.get("event", 0))
-
+        if sample < 0 or sample > 15:
+            continue
         for p in points:
             all_points.append({
                 "channel": channel,
                 "sample": sample,
                 "value": p["value"],
-                "event": event
+                "time": ts,
             })
 
-    df = pd.DataFrame(all_points)
-    if df.empty:
-        return df
-
-    last_event = df["event"].max()
-    df_last = df[df["event"] == last_event]
-    df_last = df_last[df_last["sample"].between(0, 15)]
-    return df_last
+    return pd.DataFrame(all_points), ts
 
 # -------------------------
 # Query CIS metadata (only delta_crc)
@@ -219,67 +467,145 @@ def query_cis_metadata():
 # -------------------------
 
 def query_cis_lin_samples(gain):
+    ts = latest_batch_time("CIS_Linearity_Samples", f"\"gain\"='{gain}'")
+    if ts is None:
+        return pd.DataFrame(), None
+
     query = f"""
-    SELECT last("value") AS value, last("dac_charge") AS dac_charge
+    SELECT "value","dac_charge"
     FROM "CIS_Linearity_Samples"
-    WHERE "gain"='{gain}'
+    WHERE "gain"='{gain}' AND time = '{ts}'
     GROUP BY "channel","gain","step"
     """
     result = client.query(query)
     rows = []
 
-    for (measurement, tags), points in result.items():
+    for (_, tags), points in result.items():
         if tags is None:
             continue
-
         channel = tags.get("channel")
         step = int(tags.get("step"))
-
         for p in points:
             rows.append({
                 "channel": channel,
                 "gain": gain,
                 "step": step,
                 "dac_charge": p["dac_charge"],
-                "value": p["value"]
+                "value": p["value"],
+                "time": ts,
             })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), ts
 
 
 
 
 def query_integrator_lin_samples():
-    query = """
-    SELECT last("value") AS value, last("dac_charge") AS dac_charge
+    ts = latest_batch_time("Integrator_Linearity_Samples")
+    if ts is None:
+        return pd.DataFrame(), None
+
+    query = f"""
+    SELECT "value","dac_charge"
     FROM "Integrator_Linearity_Samples"
+    WHERE time = '{ts}'
     GROUP BY "channel","step"
     """
-
     result = client.query(query)
     rows = []
 
-    for (measurement, tags), points in result.items():
+    for (_, tags), points in result.items():
         if tags is None:
             continue
-
         channel = tags.get("channel")
         step = int(tags.get("step"))
-
         for p in points:
             rows.append({
                 "channel": channel,
                 "step": step,
                 "dac_charge": p["dac_charge"],
-                "value": p["value"]
+                "value": p["value"],
+                "time": ts,
             })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), ts
+
+
+# -------------------------
+# Query CIS phase-scan samples (pulse reconstruction)
+# -------------------------
+PHASE_SCAN_NS_PER_SAMPLE = 25.0
+PHASE_SCAN_NS_PER_PHASE = 25.0 / 32.0
+
+
+def phase_sample_to_t_ns(sample, phase):
+    """Reconstructed time axis: sample×25 + (31−phase)×(25/32) ns."""
+    return float(sample) * PHASE_SCAN_NS_PER_SAMPLE + (
+        31.0 - float(phase)
+    ) * PHASE_SCAN_NS_PER_PHASE
+
+
+def _query_cis_phase_scan_gain(gain):
+    ts = latest_batch_time("CIS_Phase_Scan_Samples", f"\"gain\"='{gain}'")
+    if ts is None:
+        return [], None
+
+    # event is always 0 in the logger; omit from GROUP BY for fewer series keys
+    query = f"""
+    SELECT "value"
+    FROM "CIS_Phase_Scan_Samples"
+    WHERE "gain"='{gain}' AND time = '{ts}' AND "event"='0'
+    GROUP BY "channel","phase-31","sample"
+    """
+    try:
+        result = client.query(query)
+    except Exception as e:
+        print(f"CIS PHASE SCAN QUERY ERROR ({gain}):", e)
+        return [], None
+
+    rows = []
+    for (_, tags), points in result.items():
+        if tags is None:
+            continue
+        channel = tags.get("channel")
+        phase = int(tags.get("phase-31", 0))
+        sample = int(tags.get("sample", 0))
+        for p in points:
+            rows.append({
+                "channel": channel,
+                "gain": gain,
+                "phase": phase,
+                "sample": sample,
+                "value": p["value"],
+                "time": ts,
+                "t_ns": phase_sample_to_t_ns(sample, phase),
+            })
+    return rows, ts
+
+
+def query_cis_phase_scan_samples():
+    """Latest CIS_Phase_Scan_Samples batches for HG and LG (parallel)."""
+    results = map_query(_query_cis_phase_scan_gain, ["HG", "LG"])
+    rows = []
+    times = []
+    for gain_rows, ts in results:
+        rows.extend(gain_rows)
+        if ts is not None:
+            times.append(ts)
+
+    df = pd.DataFrame(rows)
+    return df, max_timestamp(times)
 
 
 # -------------------------
 # Plot builders
 # -------------------------
+
+CHANNEL_OVERLAY_COLORS = [
+    "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#bfef45", "#fabed4", "#469990", "#dcbeff",
+]
+
 
 def make_adc_lin_combined(df_hg, df_lg, md_label):
     """
@@ -292,7 +618,9 @@ def make_adc_lin_combined(df_hg, df_lg, md_label):
     fig = make_subplots(
         rows=2,
         cols=6,
-        subplot_titles=["" for _ in channels]
+        subplot_titles=[f"CH{i}" for i in range(12)],
+        horizontal_spacing=0.03,
+        vertical_spacing=0.10,
     )
 
     for i, full_ch in enumerate(channels):
@@ -302,35 +630,38 @@ def make_adc_lin_combined(df_hg, df_lg, md_label):
         ch_hg = df_hg[df_hg["channel"] == full_ch].sort_values("adc_input")
         ch_lg = df_lg[df_lg["channel"] == full_ch].sort_values("adc_input")
 
+        x_hg = ch_hg["adc_input"].tolist()
+        x_lg = ch_lg["adc_input"].tolist()
         hg_samples = ch_hg["value"].tolist()
         lg_samples = ch_lg["value"].tolist()
 
-        hg_std = ch_hg.get("std", [0]*len(hg_samples)).tolist()
-        lg_std = ch_lg.get("std", [0]*len(lg_samples)).tolist()
+        hg_std = ch_hg["std"].tolist() if "std" in ch_hg.columns else [0] * len(hg_samples)
+        lg_std = ch_lg["std"].tolist() if "std" in ch_lg.columns else [0] * len(lg_samples)
 
         # Linear fit
         if hg_samples:
-            slope_hg, intercept_hg, r2_hg, maxdev_hg = linear_fit(ch_hg["adc_input"].tolist(), hg_samples)
-            fit_hg = [slope_hg * x + intercept_hg for x in ch_hg["adc_input"].tolist()]
+            slope_hg, intercept_hg, r2_hg, maxdev_hg = linear_fit(x_hg, hg_samples)
+            fit_hg = [slope_hg * x + intercept_hg for x in x_hg]
         else:
-            fit_hg, maxdev_hg = [], 0
+            slope_hg, r2_hg, fit_hg, maxdev_hg = 0, 0, [], 0
 
         if lg_samples:
-            slope_lg, intercept_lg, r2_lg, maxdev_lg = linear_fit(ch_lg["adc_input"].tolist(), lg_samples)
-            fit_lg = [slope_lg * x + intercept_lg for x in ch_lg["adc_input"].tolist()]
+            slope_lg, intercept_lg, r2_lg, maxdev_lg = linear_fit(x_lg, lg_samples)
+            fit_lg = [slope_lg * x + intercept_lg for x in x_lg]
         else:
-            fit_lg, maxdev_lg = [], 0
+            slope_lg, r2_lg, fit_lg, maxdev_lg = 0, 0, [], 0
 
         # HG trace
         fig.add_trace(go.Scatter(
-            x=ch_hg["adc_input"],
+            x=x_hg,
             y=hg_samples,
             error_y=dict(type='data', array=hg_std, visible=True),
             mode='markers',
-            marker=dict(size=5, color='#FF0000'),
+            marker=dict(size=4, color='#FF4444'),
             hovertemplate=(
                 "Input: %{x}<br>Value: %{y}<br>"
                 f"Slope: {slope_hg:.3f}<br>"
+                f"R²: {r2_hg:.3f}<br>"
                 f"Max dev: {maxdev_hg:.1f}<extra>HG</extra>"
             ),
             showlegend=False
@@ -338,23 +669,24 @@ def make_adc_lin_combined(df_hg, df_lg, md_label):
 
         # HG fit line
         fig.add_trace(go.Scatter(
-            x=ch_hg["adc_input"],
+            x=x_hg,
             y=fit_hg,
             mode='lines',
-            line=dict(color='#00FF00'),
+            line=dict(color='#66FF66', width=1),
             showlegend=False
         ), row=row, col=col)
 
         # LG trace
         fig.add_trace(go.Scatter(
-            x=ch_lg["adc_input"],
+            x=x_lg,
             y=lg_samples,
             error_y=dict(type='data', array=lg_std, visible=True),
             mode='markers',
-            marker=dict(size=5, color='#00FFFF'),
+            marker=dict(size=4, color='#00E5FF'),
             hovertemplate=(
                 "Input: %{x}<br>Value: %{y}<br>"
                 f"Slope: {slope_lg:.3f}<br>"
+                f"R²: {r2_lg:.3f}<br>"
                 f"Max dev: {maxdev_lg:.1f}<extra>LG</extra>"
             ),
             showlegend=False
@@ -362,32 +694,20 @@ def make_adc_lin_combined(df_hg, df_lg, md_label):
 
         # LG fit line
         fig.add_trace(go.Scatter(
-            x=ch_lg["adc_input"],
+            x=x_lg,
             y=fit_lg,
             mode='lines',
-            line=dict(color='#00FF00'),
+            line=dict(color='#66FF66', width=1),
             showlegend=False
         ), row=row, col=col)
 
-    # Layout
-    fig.update_layout(
-        autosize=True,
-        height=None,
-        width=None,
-        showlegend=False,
-        title_text=md_label,
-        title_x=0.5,
-        margin=dict(l=5, r=5, t=25, b=5),
-        plot_bgcolor="#111111",
-        paper_bgcolor="#111111",
-        font=dict(color="white")
-    )
+        if hg_samples or lg_samples:
+            add_subplot_metric(
+                fig, row, col,
+                f"Δ {maxdev_hg:.0f}/{maxdev_lg:.0f}"
+            )
 
-    # Set all axes 0-4096 and hide ticks
-    for axis in fig.layout:
-        if isinstance(fig.layout[axis], go.layout.XAxis) or isinstance(fig.layout[axis], go.layout.YAxis):
-            fig.layout[axis].update(showticklabels=False, showgrid=True, gridcolor="#333", range=[0, 4096])
-
+    apply_md_layout(fig, md_label, x_range=[0, 4096], y_range=[0, 4096])
     return fig
 
 def make_cis_lin_combined(df_hg, df_lg, md_label):
@@ -401,7 +721,9 @@ def make_cis_lin_combined(df_hg, df_lg, md_label):
     fig = make_subplots(
         rows=2,
         cols=6,
-        subplot_titles=["" for _ in channels]
+        subplot_titles=[f"CH{i}" for i in range(12)],
+        horizontal_spacing=0.03,
+        vertical_spacing=0.10,
     )
 
     for i, full_ch in enumerate(channels):
@@ -411,63 +733,76 @@ def make_cis_lin_combined(df_hg, df_lg, md_label):
         ch_hg = df_hg[df_hg["channel"] == full_ch].sort_values("dac_charge")
         ch_lg = df_lg[df_lg["channel"] == full_ch].sort_values("dac_charge")
 
+        x_hg = ch_hg["dac_charge"].tolist()
+        x_lg = ch_lg["dac_charge"].tolist()
         hg_samples = ch_hg["value"].tolist()
         lg_samples = ch_lg["value"].tolist()
 
-        pedestal_hg, peak_hg, peak_idx_hg, center_hg, fwhm_hg = analyze_pulse(hg_samples)
-        pedestal_lg, peak_lg, peak_idx_lg, center_lg, fwhm_lg = analyze_pulse(lg_samples)
+        if hg_samples:
+            slope_hg, intercept_hg, r2_hg, maxdev_hg = linear_fit(x_hg, hg_samples)
+            fit_hg = [slope_hg * x + intercept_hg for x in x_hg]
+        else:
+            slope_hg, r2_hg, fit_hg, maxdev_hg = 0, 0, [], 0
+
+        if lg_samples:
+            slope_lg, intercept_lg, r2_lg, maxdev_lg = linear_fit(x_lg, lg_samples)
+            fit_lg = [slope_lg * x + intercept_lg for x in x_lg]
+        else:
+            slope_lg, r2_lg, fit_lg, maxdev_lg = 0, 0, [], 0
 
         # HG trace
         fig.add_trace(go.Scatter(
-            x=ch_hg["dac_charge"],
+            x=x_hg,
             y=hg_samples,
             mode="markers",
-            marker=dict(color='#FF0000', size=5),
+            marker=dict(color='#FF4444', size=4),
             hovertemplate=(
                 "DAC: %{x}<br>Value: %{y}<br>"
-                f"Pedestal: {pedestal_hg:.1f}<br>"
-                f"Peak: {peak_hg:.1f}<br>"
-                f"Center: {center_hg:.1f}<br>"
-                f"FWHM: {fwhm_hg:.1f}<extra>HG</extra>"
+                f"Slope: {slope_hg:.3f}<br>"
+                f"R²: {r2_hg:.3f}<br>"
+                f"Max dev: {maxdev_hg:.1f}<extra>HG</extra>"
             ),
+            showlegend=False
+        ), row=row, col=col)
+
+        fig.add_trace(go.Scatter(
+            x=x_hg,
+            y=fit_hg,
+            mode="lines",
+            line=dict(color='#66FF66', width=1),
             showlegend=False
         ), row=row, col=col)
 
         # LG trace
         fig.add_trace(go.Scatter(
-            x=ch_lg["dac_charge"],
+            x=x_lg,
             y=lg_samples,
             mode="markers",
-            marker=dict(color='#00FFFF', size=5),
+            marker=dict(color='#00E5FF', size=4),
             hovertemplate=(
                 "DAC: %{x}<br>Value: %{y}<br>"
-                f"Pedestal: {pedestal_lg:.1f}<br>"
-                f"Peak: {peak_lg:.1f}<br>"
-                f"Center: {center_lg:.1f}<br>"
-                f"FWHM: {fwhm_lg:.1f}<extra>LG</extra>"
+                f"Slope: {slope_lg:.3f}<br>"
+                f"R²: {r2_lg:.3f}<br>"
+                f"Max dev: {maxdev_lg:.1f}<extra>LG</extra>"
             ),
             showlegend=False
         ), row=row, col=col)
 
-    # Layout
-    fig.update_layout(
-        autosize=True,
-        height=None,
-        width=None,
-        showlegend=False,
-        title_text=md_label,
-        title_x=0.5,
-        margin=dict(l=5, r=5, t=25, b=5),
-        plot_bgcolor="#111111",
-        paper_bgcolor="#111111",
-        font=dict(color="white")
-    )
+        fig.add_trace(go.Scatter(
+            x=x_lg,
+            y=fit_lg,
+            mode="lines",
+            line=dict(color='#66FF66', width=1),
+            showlegend=False
+        ), row=row, col=col)
 
-    # Set all axes to 0-4096 and hide ticks
-    for axis in fig.layout:
-        if isinstance(fig.layout[axis], go.layout.XAxis) or isinstance(fig.layout[axis], go.layout.YAxis):
-            fig.layout[axis].update(showticklabels=False, showgrid=True, gridcolor="#333", range=[0, 4096])
+        if hg_samples or lg_samples:
+            add_subplot_metric(
+                fig, row, col,
+                f"Δ {maxdev_hg:.0f}/{maxdev_lg:.0f}"
+            )
 
+    apply_md_layout(fig, md_label, x_range=[0, 4096], y_range=[0, 4096])
     return fig
 
 def make_cis_combined(df_hg, df_lg, md_label, meta_crc):
@@ -477,11 +812,14 @@ def make_cis_combined(df_hg, df_lg, md_label, meta_crc):
     X-axis range: 0-15, Y-axis auto.
     """
     channels = [f"{md_label}_CH{i}" for i in range(12)]
+    crc_axes = []
 
     fig = make_subplots(
         rows=2,
         cols=6,
-        subplot_titles=["" for _ in channels]
+        subplot_titles=[f"CH{i}" for i in range(12)],
+        horizontal_spacing=0.03,
+        vertical_spacing=0.10,
     )
 
     for i, full_ch in enumerate(channels):
@@ -497,12 +835,16 @@ def make_cis_combined(df_hg, df_lg, md_label, meta_crc):
         pedestal_hg, peak_hg, peak_idx_hg, center_hg, fwhm_hg = analyze_pulse(hg_samples)
         pedestal_lg, peak_lg, peak_idx_lg, center_lg, fwhm_lg = analyze_pulse(lg_samples)
 
+        x_hg = ch_hg["sample"].tolist()
+        x_lg = ch_lg["sample"].tolist()
+
         # HG trace
         fig.add_trace(go.Scatter(
-            x=ch_hg["sample"],
+            x=x_hg,
             y=hg_samples,
-            mode="markers",
-            marker=dict(color='#FF0000', size=5),
+            mode="markers+lines",
+            marker=dict(color='#FF4444', size=4),
+            line=dict(color='#FF4444', width=1),
             hovertemplate=(
                 "Sample: %{x}<br>"
                 "Value: %{y}<br>"
@@ -516,10 +858,11 @@ def make_cis_combined(df_hg, df_lg, md_label, meta_crc):
 
         # LG trace
         fig.add_trace(go.Scatter(
-            x=ch_lg["sample"],
+            x=x_lg,
             y=lg_samples,
-            mode="markers",
-            marker=dict(color='#00FFFF', size=5),
+            mode="markers+lines",
+            marker=dict(color='#00E5FF', size=4),
+            line=dict(color='#00E5FF', width=1),
             hovertemplate=(
                 "Sample: %{x}<br>"
                 "Value: %{y}<br>"
@@ -533,11 +876,11 @@ def make_cis_combined(df_hg, df_lg, md_label, meta_crc):
 
         # HG peak line
         if peak_idx_hg > 0:
-            fig.add_vline(x=peak_idx_hg, line=dict(color='#FF0000', width=1), row=row, col=col)
+            fig.add_vline(x=peak_idx_hg, line=dict(color='#FF4444', width=1, dash="dot"), row=row, col=col)
 
         # LG peak line
         if peak_idx_lg > 0:
-            fig.add_vline(x=peak_idx_lg, line=dict(color='#00FFFF', width=1), row=row, col=col)
+            fig.add_vline(x=peak_idx_lg, line=dict(color='#00E5FF', width=1, dash="dot"), row=row, col=col)
 
         # HG FWHM
         if fwhm_hg > 0:
@@ -547,8 +890,9 @@ def make_cis_combined(df_hg, df_lg, md_label, meta_crc):
                 x1=peak_idx_hg + fwhm_hg / 2,
                 y0=0,
                 y1=max(hg_samples) if hg_samples else 4096,
-                fillcolor="#FF0000",
-                opacity=0.2,
+                fillcolor="#FF4444",
+                opacity=0.15,
+                line_width=0,
                 row=row,
                 col=col
             )
@@ -561,51 +905,48 @@ def make_cis_combined(df_hg, df_lg, md_label, meta_crc):
                 x1=peak_idx_lg + fwhm_lg / 2,
                 y0=0,
                 y1=max(lg_samples) if lg_samples else 4096,
-                fillcolor="#00FFFF",
-                opacity=0.2,
+                fillcolor="#00E5FF",
+                opacity=0.15,
+                line_width=0,
                 row=row,
                 col=col
             )
 
-        # CRC error highlight
         delta_crc = meta_crc.get(full_ch, {}).get("delta_crc", 0)
+        if hg_samples or lg_samples:
+            crc_flag = " CRC!" if delta_crc > 0 else ""
+            add_subplot_metric(
+                fig, row, col,
+                f"Pk {peak_hg:.0f}/{peak_lg:.0f}{crc_flag}"
+            )
+
+        # CRC error highlight (borders applied after shared layout)
         if delta_crc > 0:
+            y_top = max(
+                max(hg_samples) if hg_samples else 0,
+                max(lg_samples) if lg_samples else 0,
+                1,
+            )
             fig.add_shape(
                 type="rect",
                 x0=0,
                 x1=15,
                 y0=0,
-                y1=4096,
-                fillcolor="gray",
-                opacity=0.4,
-                layer="above",
+                y1=y_top,
+                fillcolor="rgba(255,80,80,0.15)",
+                opacity=1.0,
+                layer="below",
                 line_width=0,
                 row=row,
                 col=col
             )
-            fig.update_xaxes(showline=True, linewidth=2, linecolor="red", row=row, col=col)
-            fig.update_yaxes(showline=True, linewidth=2, linecolor="red", row=row, col=col)
+            crc_axes.append((row, col))
 
-    # Layout
-    fig.update_layout(
-        autosize=True,
-        height=None,
-        width=None,
-        showlegend=False,
-        title_text=md_label,
-        title_x=0.5,
-        margin=dict(l=5, r=5, t=25, b=5),
-        plot_bgcolor="#111111",
-        paper_bgcolor="#111111",
-        font=dict(color="white")
-    )
+    apply_md_layout(fig, md_label, x_range=[0, 15], y_range=None)
 
-    # Axes: x fixed 0–15, y auto, hide ticks
-    for axis in fig.layout:
-        if isinstance(fig.layout[axis], go.layout.XAxis):
-            fig.layout[axis].update(showticklabels=False, showgrid=True, gridcolor="#333", range=[0, 15])
-        if isinstance(fig.layout[axis], go.layout.YAxis):
-            fig.layout[axis].update(showticklabels=False, showgrid=True, gridcolor="#333")
+    for row, col in crc_axes:
+        fig.update_xaxes(showline=True, linewidth=2, linecolor="#FF5555", mirror=True, row=row, col=col)
+        fig.update_yaxes(showline=True, linewidth=2, linecolor="#FF5555", mirror=True, row=row, col=col)
 
     return fig
 
@@ -620,7 +961,9 @@ def make_integrator_lin_combined(df, md_label):
     fig = make_subplots(
         rows=2,
         cols=6,
-        subplot_titles=["" for _ in channels]
+        subplot_titles=[f"CH{i}" for i in range(12)],
+        horizontal_spacing=0.03,
+        vertical_spacing=0.10,
     )
 
     for i, full_ch in enumerate(channels):
@@ -644,7 +987,7 @@ def make_integrator_lin_combined(df, md_label):
             x=x,
             y=y,
             mode='markers',
-            marker=dict(size=5, color='#FFA500'),
+            marker=dict(size=4, color='#FFA500'),
             hovertemplate=(
                 "DAC: %{x}<br>Value: %{y}<br>"
                 f"Slope: {slope:.3f}<br>"
@@ -659,43 +1002,143 @@ def make_integrator_lin_combined(df, md_label):
             x=x,
             y=fit,
             mode='lines',
-            line=dict(color='#00FF00'),
+            line=dict(color='#66FF66', width=1),
             showlegend=False
         ), row=row, col=col)
+
+        if y:
+            add_subplot_metric(
+                fig, row, col,
+                f"Δ {maxdev:.0f}  R² {r2:.3f}"
+            )
+
+    apply_md_layout(
+        fig, md_label,
+        x_range=[0, 4096],
+        y_range=[0, 65535],
+        show_hg_lg_legend=False,
+    )
+    return fig
+
+
+def make_cis_phase_recon_plot(df, md_label):
+    """
+    Per MD: two stacked plots (LG on top, HG below), channels overlapped.
+    Time axis from phase scan: t_ns = sample×25 + (31−phase)×(25/32).
+    Legend sits below both plots.
+    """
+    channels = [f"{md_label}_CH{i}" for i in range(12)]
+    md_df = df[df["channel"].isin(channels)]
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=("LG", "HG"),
+        row_heights=[0.5, 0.5],
+    )
+
+    if md_df.empty:
+        fig.update_layout(
+            title_text=md_label,
+            paper_bgcolor="#111111",
+            plot_bgcolor="#111111",
+            font=dict(color="white"),
+        )
+        return fig
+
+    md_df = md_df.sort_values(["channel", "gain", "t_ns"])
+    grouped = md_df.groupby(["channel", "gain"], sort=False)
+
+    # Row 1 = LG, row 2 = HG
+    for gain, row in (("LG", 1), ("HG", 2)):
+        for i, full_ch in enumerate(channels):
+            key = (full_ch, gain)
+            if key not in grouped.groups:
+                continue
+            gdf = grouped.get_group(key)
+            if len(gdf) > 320:
+                gdf = gdf.iloc[::2]
+
+            color = CHANNEL_OVERLAY_COLORS[i % len(CHANNEL_OVERLAY_COLORS)]
+            fig.add_trace(
+                go.Scattergl(
+                    x=gdf["t_ns"].tolist(),
+                    y=gdf["value"].tolist(),
+                    mode="lines",
+                    name=f"CH{i}",
+                    legendgroup=f"CH{i}",
+                    showlegend=(gain == "LG"),  # one legend entry per channel
+                    line=dict(color=color, width=1.4),
+                    opacity=0.85,
+                    hovertemplate=(
+                        f"{full_ch} {gain}<br>"
+                        "t: %{x:.2f} ns<br>"
+                        "ADC: %{y:.1f}<extra></extra>"
+                    ),
+                ),
+                row=row,
+                col=1,
+            )
 
     fig.update_layout(
         autosize=True,
         height=None,
         width=None,
-        showlegend=False,
-        title_text=md_label,
-        title_x=0.5,
-        margin=dict(l=5, r=5, t=25, b=5),
+        title=dict(
+            text=f"{md_label}<span style='font-size:10px; color:#aaa'>"
+                 "&nbsp;&nbsp;phase-scan recon</span>",
+            x=0.5,
+            xanchor="center",
+            font=dict(size=13, color="white"),
+            pad=dict(t=0, b=0),
+        ),
+        margin=dict(l=42, r=10, t=36, b=52),
         plot_bgcolor="#111111",
         paper_bgcolor="#111111",
-        font=dict(color="white")
+        font=dict(color="white", size=9),
+        hovermode="closest",
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.12,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=9),
+            bgcolor="rgba(0,0,0,0)",
+            tracegroupgap=2,
+        ),
     )
 
-    # Same style as others
-    for axis in fig.layout:
-        if isinstance(fig.layout[axis], go.layout.XAxis):
-            fig.layout[axis].update(
-                showticklabels=False,
-                showgrid=True,
-                gridcolor="#333",
-                range=[0, 4096]
-            )
+    fig.update_annotations(font=dict(size=11, color="#cccccc"))
 
-        if isinstance(fig.layout[axis], go.layout.YAxis):
-            fig.layout[axis].update(
-                showticklabels=False,
-                showgrid=True,
-                gridcolor="#333",
-                range=[0, 65535]
-            )
+    for row in (1, 2):
+        fig.update_xaxes(
+            showgrid=True,
+            gridcolor="#333333",
+            zeroline=False,
+            tickfont=dict(size=9, color="#aaaaaa"),
+            range=[0, 400],
+            row=row,
+            col=1,
+        )
+        fig.update_yaxes(
+            title=dict(text="ADC", font=dict(size=10, color="#cccccc")),
+            showgrid=True,
+            gridcolor="#333333",
+            zeroline=False,
+            tickfont=dict(size=9, color="#aaaaaa"),
+            row=row,
+            col=1,
+        )
 
-
-
+    # X label only on bottom (HG) panel
+    fig.update_xaxes(
+        title=dict(text="t [ns]", font=dict(size=10, color="#cccccc")),
+        row=2,
+        col=1,
+    )
     return fig
 
 
@@ -704,35 +1147,57 @@ def make_integrator_lin_combined(df, md_label):
 # -------------------------
 @app.route("/")
 def dashboard():
-    df_hg = query_cis_samples("HG")
-    md_labels = sorted(set(
+    # Avoid a heavy Influx round-trip just to build the empty MD grid
+    md_labels = [f"PprGTH_MD{i}" for i in range(1, 5)]
+    test_name = ""
+    return render_template("dashboard.html", md_labels=md_labels, test_name=test_name)
+
+
+def _md_labels_from_df(df):
+    if df is None or df.empty or "channel" not in df.columns:
+        return []
+    return sorted(set(
         ch.split("_MD")[0] + "_MD" + ch.split("_MD")[1][0]
-        for ch in df_hg["channel"].unique()
+        for ch in df["channel"].unique()
     ))
 
-    test_name = "" 
-    return render_template("dashboard.html", md_labels=md_labels, test_name=test_name)
+
+def _build_figures(md_labels, builder):
+    return [fig_to_jsonable(builder(md)) for md in md_labels]
+
+
+def _cached_payload(cache_key, producer):
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return Response(cached, mimetype="application/json")
+    payload = producer()
+    body = json.dumps(payload, separators=(",", ":"))
+    cache_set(cache_key, body)
+    return Response(body, mimetype="application/json")
 
 
 @app.route("/api/cis_all")
 def api_cis_all():
-    try:
-        df_hg = query_cis_samples("HG")
-        df_lg = query_cis_samples("LG")
+    def produce():
+        (df_hg, ts_hg), (df_lg, ts_lg) = map_query(
+            query_cis_samples, ["HG", "LG"]
+        )
         meta_crc = query_cis_metadata()
+        md_labels = _md_labels_from_df(df_hg)
+        data_ts, ts_warn = slide_timestamp_info(
+            df_hg, df_lg, labels=["HG", "LG"]
+        )
+        return {
+            "timestamp": data_ts,
+            "timestamp_warning": ts_warn,
+            "figures": _build_figures(
+                md_labels,
+                lambda md: make_cis_combined(df_hg, df_lg, md, meta_crc),
+            ),
+        }
 
-        md_labels = sorted(set(
-            ch.split("_MD")[0] + "_MD" + ch.split("_MD")[1][0]
-            for ch in df_hg["channel"].unique()
-        ))
-
-        figs_json = []
-        for md in md_labels:
-            fig = make_cis_combined(df_hg, df_lg, md, meta_crc)
-            figs_json.append(json.loads(fig.to_json()))
-
-        return jsonify(figs_json)
-
+    try:
+        return _cached_payload("cis_all_v2", produce)
     except Exception as e:
         print("CIS ALL ERROR:", e)
         return jsonify({"error": str(e)}), 500
@@ -740,21 +1205,25 @@ def api_cis_all():
 
 @app.route("/api/adc_linearity_all")
 def api_adc_lin_all():
+    def produce():
+        (df_hg, ts_hg), (df_lg, ts_lg) = map_query(
+            query_adc_lin_samples, ["HG", "LG"]
+        )
+        md_labels = _md_labels_from_df(df_hg)
+        data_ts, ts_warn = slide_timestamp_info(
+            df_hg, df_lg, labels=["HG", "LG"]
+        )
+        return {
+            "timestamp": data_ts,
+            "timestamp_warning": ts_warn,
+            "figures": _build_figures(
+                md_labels,
+                lambda md: make_adc_lin_combined(df_hg, df_lg, md),
+            ),
+        }
+
     try:
-        df_hg = query_adc_lin_samples("HG")
-        df_lg = query_adc_lin_samples("LG")
-
-        md_labels = sorted(set(
-            ch.split("_MD")[0] + "_MD" + ch.split("_MD")[1][0]
-            for ch in df_hg["channel"].unique()
-        ))
-
-        figs_json = []
-        for md in md_labels:
-            fig = make_adc_lin_combined(df_hg, df_lg, md)
-            figs_json.append(json.loads(fig.to_json()))
-        return jsonify(figs_json)
-
+        return _cached_payload("adc_linearity_all_v2", produce)
     except Exception as e:
         print("ADC LIN ALL ERROR:", e)
         return jsonify({"error": str(e)}), 500
@@ -762,22 +1231,25 @@ def api_adc_lin_all():
 
 @app.route("/api/cis_linearity_all")
 def api_cis_lin_all():
+    def produce():
+        (df_hg, ts_hg), (df_lg, ts_lg) = map_query(
+            query_cis_lin_samples, ["HG", "LG"]
+        )
+        md_labels = _md_labels_from_df(df_hg)
+        data_ts, ts_warn = slide_timestamp_info(
+            df_hg, df_lg, labels=["HG", "LG"]
+        )
+        return {
+            "timestamp": data_ts,
+            "timestamp_warning": ts_warn,
+            "figures": _build_figures(
+                md_labels,
+                lambda md: make_cis_lin_combined(df_hg, df_lg, md),
+            ),
+        }
+
     try:
-        df_hg = query_cis_lin_samples("HG")
-        df_lg = query_cis_lin_samples("LG")
-
-        md_labels = sorted(set(
-            ch.split("_MD")[0] + "_MD" + ch.split("_MD")[1][0]
-            for ch in df_hg["channel"].unique()
-        ))
-
-        figs_json = []
-        for md in md_labels:
-            fig = make_cis_lin_combined(df_hg, df_lg, md)  # single figure for HG + LG
-            figs_json.append(json.loads(fig.to_json()))
-
-        return jsonify(figs_json)
-
+        return _cached_payload("cis_linearity_all_v2", produce)
     except Exception as e:
         print("CIS LIN ALL ERROR:", e)
         return jsonify({"error": str(e)}), 500
@@ -785,28 +1257,56 @@ def api_cis_lin_all():
 
 @app.route("/api/integrator_linearity_all")
 def api_integrator_lin_all():
-    try:
-        df = query_integrator_lin_samples()
-
+    def produce():
+        df, ts = query_integrator_lin_samples()
         if df.empty:
-            return jsonify([])
+            return {"timestamp": None, "timestamp_warning": None, "figures": []}
+        md_labels = _md_labels_from_df(df)
+        data_ts, ts_warn = slide_timestamp_info(df, labels=["data"])
+        return {
+            "timestamp": data_ts,
+            "timestamp_warning": ts_warn,
+            "figures": _build_figures(
+                md_labels,
+                lambda md: make_integrator_lin_combined(df, md),
+            ),
+        }
 
-        md_labels = sorted(set(
-            ch.split("_MD")[0] + "_MD" + ch.split("_MD")[1][0]
-            for ch in df["channel"].unique()
-        ))
-
-        figs_json = []
-        for md in md_labels:
-            fig = make_integrator_lin_combined(df, md)
-            figs_json.append(json.loads(fig.to_json()))
-
-        return jsonify(figs_json)
-
+    try:
+        return _cached_payload("integrator_linearity_all_v2", produce)
     except Exception as e:
         print("INTEGRATOR LIN ALL ERROR:", e)
         return jsonify({"error": str(e)}), 500
-    
+
+
+@app.route("/api/cis_phase_recon_all")
+def api_cis_phase_recon_all():
+    def produce():
+        df, _data_ts = query_cis_phase_scan_samples()
+        if df.empty:
+            return {"timestamp": None, "timestamp_warning": None, "figures": []}
+        md_labels = _md_labels_from_df(df)
+        df_hg = df[df["gain"] == "HG"] if "gain" in df.columns else df
+        df_lg = df[df["gain"] == "LG"] if "gain" in df.columns else df.iloc[0:0]
+        data_ts, ts_warn = slide_timestamp_info(
+            df_hg, df_lg, labels=["HG", "LG"]
+        )
+        return {
+            "timestamp": data_ts,
+            "timestamp_warning": ts_warn,
+            "figures": _build_figures(
+                md_labels,
+                lambda md: make_cis_phase_recon_plot(df, md),
+            ),
+        }
+
+    try:
+        return _cached_payload("cis_phase_recon_all_v2", produce)
+    except Exception as e:
+        print("CIS PHASE RECON ALL ERROR:", e)
+        return jsonify({"error": str(e)}), 500
+
+
 # -------------------------
 # Run server
 # -------------------------

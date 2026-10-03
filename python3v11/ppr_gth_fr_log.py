@@ -124,28 +124,30 @@ ipbus = IPbus(controlhub_ipaddress, ppr_ipaddress)
 # ==========================================================
 # MAIN LOOP
 # ==========================================================
-last_eye_time = 0  # or time.time() if you want delay before first run
 wait_time = 1
+eye_every_n_cycles = 10
+cis_phase_every_n_cycles = 2
+cycle = 0
+last_eye_duration_s = None  # measured on eye cycles; used as sleep on skip cycles
+last_cis_phase_duration_s = None
 print_memory_usage()
 
 while True:
 
     try:
-        
-        # now = time.time()
-
-        # # Run eye test every 60 seconds
-        # if now - last_eye_time >= 60:
-        #     all_points = eye_diagram_test(ppr, ppr_label)
-        #     influxdb.write_points(all_points)
-        #     last_eye_time = now
-
         print_memory_usage_compact()
-        all_points = eye_diagram_test(ppr, ppr_label)
-        influxdb.write_points(all_points)
-        del all_points
-        gc.collect()
-        # last_eye_time = now
+
+        if cycle % eye_every_n_cycles == 0:
+            t0 = time.time()
+            all_points = eye_diagram_test(ppr, ppr_label)
+            influxdb.write_points(all_points)
+            del all_points
+            gc.collect()
+            last_eye_duration_s = time.time() - t0
+            print(f"Eye diagram took {last_eye_duration_s:.1f}s")
+        elif last_eye_duration_s is not None:
+            print(f"Skipping eye diagram; sleeping {last_eye_duration_s:.1f}s")
+            time.sleep(last_eye_duration_s)
 
         # --- Normal cycle continues ---
         all_points = integrator_lin_test(ppr, feb, ppr_label)
@@ -181,16 +183,27 @@ while True:
 
         all_points = cis_test(ppr, feb, ppr_label)
         influxdb.write_points(all_points)
-        
-        print_memory_usage_compact()
-        
         del all_points
         gc.collect()
         time.sleep(wait_time)
 
-        check_memory_or_exit()        
-        
-        # time.sleep(60)
+        if cycle % cis_phase_every_n_cycles == 0:
+            t0 = time.time()
+            all_points = cis_phase_scan(ppr, feb, ipbus, ppr_label)
+            influxdb.write_points(all_points)
+            del all_points
+            gc.collect()
+            last_cis_phase_duration_s = time.time() - t0
+            print(f"CIS phase scan took {last_cis_phase_duration_s:.1f}s")
+        elif last_cis_phase_duration_s is not None:
+            print(f"Skipping CIS phase scan; sleeping {last_cis_phase_duration_s:.1f}s")
+            time.sleep(last_cis_phase_duration_s)
+
+        print_memory_usage_compact()
+        time.sleep(wait_time)
+
+        check_memory_or_exit()
+        cycle += 1
         
     except Exception as e:
         print("Runtime error:", e)

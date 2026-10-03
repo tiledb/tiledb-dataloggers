@@ -8,7 +8,19 @@
 </head>
 
 <body>
-    <h1>Dashboard {{ test_name }} </h1>
+    <div id="tsWarning" class="ts-warning" hidden></div>
+
+    <div id="loadProgress" class="load-progress" hidden>
+        <div class="load-progress-label" id="loadProgressLabel">Loading…</div>
+        <div class="load-progress-row">
+            <div class="load-progress-track">
+                <div class="load-progress-bar" id="loadProgressBar"></div>
+            </div>
+            <div class="load-progress-pct" id="loadProgressPct">0%</div>
+        </div>
+    </div>
+
+    <h1 id="main-title">Dashboard {{ test_name }}</h1>
     <div class="md-grid">
         {% for md_label in md_labels %}
         <div class="md-box">
@@ -18,6 +30,18 @@
     </div>
 
     <div id="controls">
+        <label class="dwell-control" for="dwellSelect">
+            <span>Update</span>
+            <select id="dwellSelect" title="Slide update interval">
+                <option value="3000">3 s</option>
+                <option value="5000">5 s</option>
+                <option value="8000" selected>8 s</option>
+                <option value="10000">10 s</option>
+                <option value="15000">15 s</option>
+                <option value="30000">30 s</option>
+                <option value="60000">60 s</option>
+            </select>
+        </label>
         <button id="playPauseBtn">⏸ Pause</button>
         <div id="carouselDots"></div>
     </div>
