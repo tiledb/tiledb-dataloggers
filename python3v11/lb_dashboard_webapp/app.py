@@ -1,3 +1,4 @@
+import argparse
 import math
 import time
 import json
@@ -12,6 +13,47 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 _API_CACHE = {}
 _CACHE_TTL_SEC = 15.0
 STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
+
+
+def build_ppr_label(y):
+    """PprGTH if Y empty, else PprGTH_Y (matches FR logger --ppr-label)."""
+    y = "" if y is None else str(y).strip()
+    return "PprGTH" if y == "" else f"PprGTH_{y}"
+
+
+def parse_cli_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="LB dashboard webapp (Influx → Plotly slides)"
+    )
+    parser.add_argument(
+        "--ppr-y",
+        "-y",
+        default="",
+        metavar="Y",
+        help="PPr index Y → label PprGTH_Y (omit for default PprGTH)",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Flask bind host (default: secrets.json)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Flask bind port (default: secrets.json)",
+    )
+    # parse_known_args: tolerate flask reloader / extra args
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
+
+_CLI_ARGS = parse_cli_args()
+PPR_LABEL = build_ppr_label(_CLI_ARGS.ppr_y)
+# Channel tag prefix, e.g. PprGTH_MD or PprGTH_2_MD
+PPR_CHANNEL_PREFIX = f"{PPR_LABEL}_MD"
+# Influx tag key prefix for CIS summary, e.g. "PprGTH MD" / "PprGTH_2 MD"
+PPR_CIS_TAG_PREFIX = f"{PPR_LABEL} MD"
 
 
 # -------------------------
@@ -142,6 +184,25 @@ def fig_to_jsonable(fig):
                 setattr(tr, attr, list(val))
     # engine=json avoids orjson binary packing (plain arrays, smaller CPU)
     return json.loads(fig.to_json(engine="json"))
+
+
+def ppr_channel_where():
+    """InfluxQL fragment restricting series to this dashboard's PPr label."""
+    # Escape for regex; prefix is always PprGTH[_N]_MD
+    return f"\"channel\" =~ /^{PPR_CHANNEL_PREFIX}/"
+
+
+def and_where(*clauses):
+    parts = [c for c in clauses if c]
+    return " AND ".join(parts) if parts else ""
+
+
+def filter_df_ppr(df):
+    """Keep only channels belonging to the selected PPr label."""
+    if df is None or getattr(df, "empty", True) or "channel" not in df.columns:
+        return df
+    mask = df["channel"].astype(str).str.startswith(PPR_CHANNEL_PREFIX)
+    return df.loc[mask].copy()
 
 
 def latest_batch_time(measurement, where_sql=""):
@@ -358,14 +419,20 @@ client = InfluxDBClient(
 
 def query_adc_lin_samples(gain):
     """Latest ADC linearity batch for one gain (exact-time read, not full-history last())."""
-    ts = latest_batch_time("ADC_Linearity_Samples", f"\"gain\"='{gain}'")
+    ch_f = ppr_channel_where()
+    gain_f = f""""gain"='{gain}'"""
+    ts = latest_batch_time(
+        "ADC_Linearity_Samples",
+        and_where(gain_f, ch_f),
+    )
     if ts is None:
         return pd.DataFrame(), None
 
+    where = and_where(gain_f, f"time = '{ts}'", ch_f)
     query = f"""
     SELECT "value","std","adc_input"
     FROM "ADC_Linearity_Samples"
-    WHERE "gain"='{gain}' AND time = '{ts}'
+    WHERE {where}
     GROUP BY "channel","gain","step"
     """
     result = client.query(query)
@@ -375,6 +442,8 @@ def query_adc_lin_samples(gain):
         if tags is None:
             continue
         channel = tags.get("channel")
+        if not str(channel).startswith(PPR_CHANNEL_PREFIX):
+            continue
         step = int(tags.get("step"))
         for p in points:
             rows.append({
@@ -395,15 +464,21 @@ def query_adc_lin_samples(gain):
 # -------------------------
 def query_cis_samples(gain):
     """Latest CIS sample batch for one gain."""
-    ts = latest_batch_time("CIS_Samples", f"\"gain\"='{gain}'")
+    ch_f = ppr_channel_where()
+    gain_f = f""""gain"='{gain}'"""
+    ts = latest_batch_time(
+        "CIS_Samples",
+        and_where(gain_f, ch_f),
+    )
     if ts is None:
         return pd.DataFrame(), None
 
     # Logger uses event=0 for the live CIS pulse; skip event cardinality in GROUP BY
+    where = and_where(gain_f, f"time = '{ts}'", "\"event\"='0'", ch_f)
     query = f"""
     SELECT "value"
     FROM "CIS_Samples"
-    WHERE "gain"='{gain}' AND time = '{ts}' AND "event"='0'
+    WHERE {where}
     GROUP BY "channel","sample"
     """
     result = client.query(query)
@@ -413,6 +488,8 @@ def query_cis_samples(gain):
         if tags is None:
             continue
         channel = tags.get("channel")
+        if not str(channel).startswith(PPR_CHANNEL_PREFIX):
+            continue
         sample = int(tags.get("sample", 0))
         if sample < 0 or sample > 15:
             continue
@@ -445,7 +522,8 @@ def query_cis_metadata():
 
         md_tag = None
         for k in tags.keys():
-            if "PprGTH" in k:
+            # Match "PprGTH MD1" or "PprGTH_2 MD1" for the selected label only
+            if k.startswith(PPR_CIS_TAG_PREFIX):
                 md_tag = k
                 break
         if md_tag is None:
@@ -467,14 +545,20 @@ def query_cis_metadata():
 # -------------------------
 
 def query_cis_lin_samples(gain):
-    ts = latest_batch_time("CIS_Linearity_Samples", f"\"gain\"='{gain}'")
+    ch_f = ppr_channel_where()
+    gain_f = f""""gain"='{gain}'"""
+    ts = latest_batch_time(
+        "CIS_Linearity_Samples",
+        and_where(gain_f, ch_f),
+    )
     if ts is None:
         return pd.DataFrame(), None
 
+    where = and_where(gain_f, f"time = '{ts}'", ch_f)
     query = f"""
     SELECT "value","dac_charge"
     FROM "CIS_Linearity_Samples"
-    WHERE "gain"='{gain}' AND time = '{ts}'
+    WHERE {where}
     GROUP BY "channel","gain","step"
     """
     result = client.query(query)
@@ -484,6 +568,8 @@ def query_cis_lin_samples(gain):
         if tags is None:
             continue
         channel = tags.get("channel")
+        if not str(channel).startswith(PPR_CHANNEL_PREFIX):
+            continue
         step = int(tags.get("step"))
         for p in points:
             rows.append({
@@ -501,14 +587,16 @@ def query_cis_lin_samples(gain):
 
 
 def query_integrator_lin_samples():
-    ts = latest_batch_time("Integrator_Linearity_Samples")
+    ch_f = ppr_channel_where()
+    ts = latest_batch_time("Integrator_Linearity_Samples", ch_f)
     if ts is None:
         return pd.DataFrame(), None
 
+    where = and_where(f"time = '{ts}'", ch_f)
     query = f"""
     SELECT "value","dac_charge"
     FROM "Integrator_Linearity_Samples"
-    WHERE time = '{ts}'
+    WHERE {where}
     GROUP BY "channel","step"
     """
     result = client.query(query)
@@ -518,6 +606,8 @@ def query_integrator_lin_samples():
         if tags is None:
             continue
         channel = tags.get("channel")
+        if not str(channel).startswith(PPR_CHANNEL_PREFIX):
+            continue
         step = int(tags.get("step"))
         for p in points:
             rows.append({
@@ -546,15 +636,21 @@ def phase_sample_to_t_ns(sample, phase):
 
 
 def _query_cis_phase_scan_gain(gain):
-    ts = latest_batch_time("CIS_Phase_Scan_Samples", f"\"gain\"='{gain}'")
+    ch_f = ppr_channel_where()
+    gain_f = f""""gain"='{gain}'"""
+    ts = latest_batch_time(
+        "CIS_Phase_Scan_Samples",
+        and_where(gain_f, ch_f),
+    )
     if ts is None:
         return [], None
 
     # event is always 0 in the logger; omit from GROUP BY for fewer series keys
+    where = and_where(gain_f, f"time = '{ts}'", "\"event\"='0'", ch_f)
     query = f"""
     SELECT "value"
     FROM "CIS_Phase_Scan_Samples"
-    WHERE "gain"='{gain}' AND time = '{ts}' AND "event"='0'
+    WHERE {where}
     GROUP BY "channel","phase-31","sample"
     """
     try:
@@ -568,6 +664,8 @@ def _query_cis_phase_scan_gain(gain):
         if tags is None:
             continue
         channel = tags.get("channel")
+        if not str(channel).startswith(PPR_CHANNEL_PREFIX):
+            continue
         phase = int(tags.get("phase-31", 0))
         sample = int(tags.get("sample", 0))
         for p in points:
@@ -1148,17 +1246,21 @@ def make_cis_phase_recon_plot(df, md_label):
 @app.route("/")
 def dashboard():
     # Avoid a heavy Influx round-trip just to build the empty MD grid
-    md_labels = [f"PprGTH_MD{i}" for i in range(1, 5)]
-    test_name = ""
+    md_labels = [f"{PPR_LABEL}_MD{i}" for i in range(1, 5)]
+    test_name = PPR_LABEL
     return render_template("dashboard.html", md_labels=md_labels, test_name=test_name)
 
 
 def _md_labels_from_df(df):
     if df is None or df.empty or "channel" not in df.columns:
         return []
+    df = filter_df_ppr(df)
+    if df.empty:
+        return []
     return sorted(set(
         ch.split("_MD")[0] + "_MD" + ch.split("_MD")[1][0]
         for ch in df["channel"].unique()
+        if "_MD" in ch and str(ch).startswith(PPR_CHANNEL_PREFIX)
     ))
 
 
@@ -1167,12 +1269,14 @@ def _build_figures(md_labels, builder):
 
 
 def _cached_payload(cache_key, producer):
-    cached = cache_get(cache_key)
+    # Include PPr label so PprGTH / PprGTH_2 caches stay separate
+    full_key = f"{cache_key}::{PPR_LABEL}"
+    cached = cache_get(full_key)
     if cached is not None:
         return Response(cached, mimetype="application/json")
     payload = producer()
     body = json.dumps(payload, separators=(",", ":"))
-    cache_set(cache_key, body)
+    cache_set(full_key, body)
     return Response(body, mimetype="application/json")
 
 
@@ -1312,4 +1416,7 @@ def api_cis_phase_recon_all():
 # -------------------------
 if __name__ == "__main__":
     flask_conf = secrets["flask"]
-    app.run(host=flask_conf["host"], port=flask_conf["port"], debug=True)
+    host = _CLI_ARGS.host or flask_conf["host"]
+    port = _CLI_ARGS.port if _CLI_ARGS.port is not None else flask_conf["port"]
+    print(f"Dashboard PPr label: {PPR_LABEL} (channel prefix {PPR_CHANNEL_PREFIX})")
+    app.run(host=host, port=port, debug=True)

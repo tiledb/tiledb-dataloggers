@@ -389,10 +389,20 @@ c_stb_sfp_ddm_tec_current = 39;
 c_stb_mb_jtag_id_q0 = 40;
 c_stb_mb_jtag_id_q1 = 41;
 c_stb_gbtx_reg_readback = 42;
+c_stb_sfp_reg_readback = 43;
 
 # Configbus hardware addresses (DB_Write_Val), from db6_design_package
 CFB_GBTX_REG_CONFIG = 0x009
 CFB_GBTX_REG_READBACK_ADDRESS = 0x011
+CFB_SFP_REG_ADDRESS = 0x004
+
+# cfb_sfp_reg_address memory select (bits 17:16 / 19:18)
+C_SFP_MEM_A2H = 0b00
+C_SFP_MEM_A0H = 0b01
+
+# SFF-8472 A0h identity bytes
+SFP_A0H_VENDOR_SN = (68, 83)
+SFP_A0H_DATECODE = (84, 91)
 
 # cfb_gbtx_reg_config bits for an I2C read sweep (0..435)
 C_GBTX_I2C_RW_BIT = 26
@@ -454,7 +464,8 @@ lut_tx_address = [
 0x348,
 0x018,
 0x019,
-0x34B
+0x34B,
+0x01A
 
 ]
 
@@ -501,7 +512,8 @@ lut_tx_address_labels = [
 "stb_sfp_ddm_tec_current",
 "stb_mb_jtag_id_q0",
 "stb_mb_jtag_id_q1",
-"stb_gbtx_reg_readback"
+"stb_gbtx_reg_readback",
+"stb_sfp_reg_readback"
 ]
 
 
@@ -538,6 +550,73 @@ def sfp_ddm_half_from_word(word, sfp_idx):
     if word is None or word == 0xFFFFFFFF:
         return None
     return (int(word) >> (16 * int(sfp_idx))) & 0xFFFF
+
+
+def pack_sfp_address(memory_sel, offset):
+    """Same byte / memory on both SFP+ cages (tilecal_sfp_i2c pack_address)."""
+    sel = int(memory_sel) & 0x3
+    offset = int(offset) & 0xFF
+    return offset | (offset << 8) | (sel << 16) | (sel << 18)
+
+
+def pack_sfp_a0h_address(offset):
+    return pack_sfp_address(C_SFP_MEM_A0H, offset)
+
+
+def _sfp_ascii_bytes(raw_bytes):
+    if raw_bytes is None or any(b is None for b in raw_bytes):
+        return None
+    chars = []
+    for b in raw_bytes:
+        b = int(b) & 0xFF
+        if b in (0x00, 0xFF):
+            continue
+        if 32 <= b <= 126:
+            chars.append(chr(b))
+    return "".join(chars).strip()
+
+
+def decode_vendor_sn(raw_bytes):
+    """SFF-8472 Vendor SN (A0h 68–83): printable ASCII, strip trailing spaces."""
+    text = _sfp_ascii_bytes(raw_bytes)
+    return text if text else "-1"
+
+
+def decode_datecode(raw_bytes):
+    """SFF-8472 date code (A0h 84–91): YYMMDD + lot → YYYY-MM-DD[ · lot]."""
+    if raw_bytes is None or len(raw_bytes) < 6 or any(
+        b is None for b in raw_bytes[:6]
+    ):
+        return "-1"
+
+    def _pair(start):
+        a = int(raw_bytes[start]) & 0xFF
+        b = int(raw_bytes[start + 1]) & 0xFF
+        chars = []
+        for x in (a, b):
+            if x in (0x00, 0xFF, 0x20):
+                continue
+            if 32 <= x <= 126:
+                chars.append(chr(x))
+        return "".join(chars)
+
+    yy = _pair(0)
+    mm = _pair(2)
+    dd = _pair(4)
+    if len(yy) != 2 or len(mm) != 2 or not yy.isdigit() or not mm.isdigit():
+        return "-1"
+    month = int(mm)
+    if not 1 <= month <= 12:
+        return "-1"
+    year = 2000 + int(yy)
+    if len(dd) == 2 and dd.isdigit() and 1 <= int(dd) <= 31:
+        date = f"{year:04d}-{month:02d}-{int(dd):02d}"
+    else:
+        date = f"{year:04d}-{month:02d}"
+    lot = _sfp_ascii_bytes(raw_bytes[6:8]) if len(raw_bytes) >= 8 else ""
+    if lot:
+        date += f" · {lot}"
+    return date
 
 
 
@@ -654,6 +733,59 @@ lut_pgood_labels = [
 # Terminal control characters
 char_line_up = '\033[1A'
 char_line_clear = '\x1b[2K'
+
+N_MD = 4
+
+
+def parse_md_spec(spec, n_md=N_MD):
+    """Parse a 1-based minidrawer spec into sorted unique 0-based indices.
+
+    Accepts ``all``, ``1-4``, ``1,2,3,4``, ``1-2,4``, and mixes of those.
+    """
+    text = "all" if spec is None else str(spec).strip().lower()
+    if text in ("", "all", "*"):
+        return list(range(n_md))
+    selected = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            left, right = part.split("-", 1)
+            try:
+                start = int(left.strip())
+                end = int(right.strip())
+            except ValueError:
+                raise ValueError(
+                    f"invalid minidrawer range: {part!r}"
+                )
+            if start > end:
+                start, end = end, start
+            for n in range(start, end + 1):
+                selected.add(n)
+        else:
+            try:
+                selected.add(int(part))
+            except ValueError:
+                raise ValueError(f"invalid minidrawer: {part!r}")
+    mds = []
+    for n in sorted(selected):
+        if n < 1 or n > n_md:
+            raise ValueError(
+                f"minidrawer {n} out of range (valid: 1-{n_md})"
+            )
+        mds.append(n - 1)
+    if not mds:
+        raise ValueError("no minidrawers selected")
+    return mds
+
+
+def resolve_mds(mds, n_md=N_MD):
+    """Normalize a minidrawer list to 0-based indices (default: all)."""
+    if mds is None:
+        return list(range(n_md))
+    return [int(md) for md in mds]
+
 
 def format_number(number):
     """

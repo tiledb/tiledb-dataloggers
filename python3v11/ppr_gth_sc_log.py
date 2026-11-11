@@ -78,12 +78,26 @@ parser.add_argument(
     help="Enable MariaDB benchtest polling and InfluxDB Bench Test logging"
 )
 
+parser.add_argument(
+    "--md",
+    default="1-4",
+    help="Minidrawers to monitor (1-based). Examples: 1-4, 1,3, 2-4, all"
+)
+
 args = parser.parse_args()
 
 ppr_label = args.ppr_label
 controlhub_ipaddress = args.controlhub_ip
 ppr_ipaddress = args.ppr_ip
 benchtest_enabled = args.benchtest
+try:
+    mds = parse_md_spec(args.md)
+except ValueError as e:
+    parser.error(str(e))
+print(
+    "Monitoring minidrawers: "
+    + ", ".join(str(md + 1) for md in mds)
+)
 
 
 # ============================================================
@@ -316,8 +330,6 @@ uplink_labels = [
     "B1"
 ]
 
-firstMD = 0
-nMD = 4
 verbose = False
 
 # Last stb_running_time_status per MD and KU side (A=0, B=1).
@@ -358,7 +370,7 @@ while True:
 
         reconnect_needed = False
 
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
 
             # ------------------------------------------------
             # STATUS READ
@@ -877,6 +889,14 @@ while True:
                     lut_tx_address[stb_idx]
                 )
 
+            ident_ok = (
+                (a_side_alive and runtime_ok[0])
+                or (b_side_alive and runtime_ok[1])
+            )
+            sfp_ident = (
+                ppr.SFP_Read_A0h_Identity(md) if ident_ok else None
+            )
+
             sfp_data = []
             for side, side_name in enumerate(["A", "B"]):
                 side_alive = (
@@ -897,6 +917,13 @@ while True:
                         fields[field_name] = decode_sfp_ddm_half(
                             raw16, kind, scale, disp
                         )
+
+                    if ok and sfp_ident is not None:
+                        fields["vendor"] = sfp_ident[side][sfp_idx]["vendor"]
+                        fields["datecode"] = sfp_ident[side][sfp_idx]["datecode"]
+                    else:
+                        fields["vendor"] = "-1"
+                        fields["datecode"] = "-1"
 
                     sfp_data.append({
                         "measurement": "SFP",

@@ -8,7 +8,7 @@ import math
 import numpy as np  # still needed for averaging stats
 from ppr_gth_fr_functions import *
 from db_ppr_ipbus import PPr, FEB, PPrReg
-from db_lib import cfb_mb_phase_config, lut_cfgbus_address
+from db_lib import N_MD, cfb_mb_phase_config, lut_cfgbus_address, resolve_mds
 
 from itertools import groupby
 from scipy.special import erfc
@@ -140,14 +140,14 @@ def trigger_pipeline_readout(ppr, feb, bcid_l1a, settle_s=0.02):
     time.sleep(settle_s)
 
 
-def adc_lin_test(ppr, feb, ppr_label):
+def adc_lin_test(ppr, feb, ppr_label, mds=None):
     bcid_l1a = 3200
     dbside = 0  # All FPGAs
     verbose = True
     nsamp = 16
     nchanperMD = 12
-    nMD = 4
-    firstMD = 0
+    nMD = N_MD
+    mds = resolve_mds(mds, nMD)
     nsteps = 10
     step_events = 1
 
@@ -181,7 +181,7 @@ def adc_lin_test(ppr, feb, ppr_label):
     # print("Setting PPr enable deadtime bit in Global Trigger Conf...")
     arm_pipeline_deadtime(ppr)
 
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         VinDACs = feb.convert_ped_ADC_to_DACs(0)
         DACbiasP, DACbiasN = VinDACs
         for feb_id in range(nchanperMD):
@@ -214,7 +214,7 @@ def adc_lin_test(ppr, feb, ppr_label):
             step_x.append(ADCped)
         # ---- Configure FEBs ----
         # print("Setting FEB ADC bias offsets...")
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
             for feb_id in range(nchanperMD):
                 # print(f"  MD{md} FEB{feb_id}: Setting DACbiasP={DACbiasP}, DACbiasN={DACbiasN}")
                 feb.set_ped_HG_pos(md, dbside, feb_id, DACbiasP)
@@ -255,7 +255,7 @@ def adc_lin_test(ppr, feb, ppr_label):
                         # print(f"  Step {step} Event {event}: MD{md} ADC{adc} ADCped {ADCped} HG mean={hg_mean:.2f} LG mean={lg_mean:.2f}")
 
 
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         VinDACs = feb.convert_ped_ADC_to_DACs(0)
         DACbiasP, DACbiasN = VinDACs
         for feb_id in range(nchanperMD):
@@ -275,7 +275,7 @@ def adc_lin_test(ppr, feb, ppr_label):
     all_points = []
     now = datetime.datetime.utcnow().isoformat()
     
-    for md in range(nMD):
+    for md in mds:
         # ascii_plot_grid(md, step_x, avgHG, avgLG, nchanperMD=nchanperMD, ncols=6, nrows=2, width=20, height=20)
         
         
@@ -421,13 +421,13 @@ def read_md_data_with_retry(ppr, feb, md, nsamp, nchanperMD, bcid_l1a, previous_
 
         
 
-def cis_test(ppr, feb, ppr_label):
+def cis_test(ppr, feb, ppr_label, mds=None):
     all_points = []
     dbside = 0  # All FPGAs
     nsamp = 16
     nchanperMD = 12
-    nMD = 4
-    firstMD = 0
+    nMD = N_MD
+    mds = resolve_mds(mds, nMD)
     step_events = 1
 
     n_events = 1  # number of CIS events per step
@@ -462,22 +462,22 @@ def cis_test(ppr, feb, ppr_label):
     # print("Ok" if ret else "Failed")
 
     # print("Reading CRC counters... ")
-    initial_crc_sideA = []
-    initial_crc_sideB = []
-    final_crc_sideA = []
-    final_crc_sideB = []
+    initial_crc_sideA = [0] * nMD
+    initial_crc_sideB = [0] * nMD
+    final_crc_sideA = [0] * nMD
+    final_crc_sideB = [0] * nMD
 
     # print("Initial CRC Counters")
     # print("=" * 40)
     # print(f"{'MD':<6}{'Side A':<15}{'Side B':<15}")
     # print("-" * 40)
 
-    for i in range(firstMD, firstMD + nMD):
+    for i in mds:
         a = ppr.get_CRC_tot_errors(i, side="A")
         b = ppr.get_CRC_tot_errors(i, side="B")
 
-        initial_crc_sideA.append(a)
-        initial_crc_sideB.append(b)
+        initial_crc_sideA[i] = a
+        initial_crc_sideB[i] = b
 
     #     print(f"{f'MD{i}':<6}{a:<15}{b:<15}")
 
@@ -494,7 +494,7 @@ def cis_test(ppr, feb, ppr_label):
     DACbiasP, DACbiasN = feb.convert_ped_ADC_to_DACs(ADCped)
     
     # print("Configuring FEB pedestal DACs... ", end="")
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         for feb_id in range(nchanperMD):
             feb.set_ped_HG_pos(md, dbside, feb_id, DACbiasP)
             feb.set_ped_HG_neg(md, dbside, feb_id, DACbiasN)
@@ -507,20 +507,20 @@ def cis_test(ppr, feb, ppr_label):
 
     # 2) Set FEB switches
     # print("Setting FEB switches... ", end="")
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         for adc in range(nchanperMD):
             ret = feb.set_switches_noise(md, dbside=2, feb=adc)
 
     # 3) Set CIS BCID parameters
     # print("Setting CIS on minidrawers... ", end="")
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         for feb_id in range(nchanperMD):
             feb.set_CIS_BCID_settings(md, dbside, BCID_charge, BCID_discharge, gain)
     # print("Ok")
 
     # 4) Set FEB CIS DACs
     # print(f"Setting FEB CIS DACs to {DACcharge}... ", end="")
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         for feb_id in range(nchanperMD):
             feb.set_CIS_DAC(md, dbside, feb_id, DACcharge)
     # print("Ok")
@@ -531,7 +531,7 @@ def cis_test(ppr, feb, ppr_label):
 
     for event in range(n_events):
         trigger_pipeline_readout(ppr, feb, bcid_l1a)
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
             for adc in range(nchanperMD):
                 # Read ADC pipeline data
                 hg_data = ppr.get_data_HG(md, adc, nsamp)
@@ -550,31 +550,31 @@ def cis_test(ppr, feb, ppr_label):
     # print(f"{'MD':<6}{'Ch':<6}{'HG_Ped':<10}{'HG_Peak':<10}{'HG_PeakIdx':<10}{'HG_Center':<12}{'HG_FWHM':<8}{'LG_Ped':<10}{'LG_Peak':<10}{'LG_PeakIdx':<10}{'LG_Center':<12}{'LG_FWHM':<8}")
     # print("-" * 80)
 
-    for i in range(firstMD, firstMD + nMD):
+    for i in mds:
         a = ppr.get_CRC_tot_errors(i, side="A")
         b = ppr.get_CRC_tot_errors(i, side="B")
 
-        final_crc_sideA.append(a)
-        final_crc_sideB.append(b)
+        final_crc_sideA[i] = a
+        final_crc_sideB[i] = b
 
     # print("\nFinal CRC Counters")
     # print("=" * 40)
     # print(f"{'MD':<6}{'A_init':<12}{'A_final':<12}{'ΔA':<12}"
     #     f"{'B_init':<12}{'B_final':<12}{'ΔB':<12}")
 
-    all_delta_crc_errors_sideA = []
-    all_delta_crc_errors_sideB = []
-    for idx, i in enumerate(range(firstMD, firstMD + nMD)):
-        a0 = initial_crc_sideA[idx]
-        b0 = initial_crc_sideB[idx]
-        a1 = final_crc_sideA[idx]
-        b1 = final_crc_sideB[idx]
+    all_delta_crc_errors_sideA = [0] * nMD
+    all_delta_crc_errors_sideB = [0] * nMD
+    for i in mds:
+        a0 = initial_crc_sideA[i]
+        b0 = initial_crc_sideB[i]
+        a1 = final_crc_sideA[i]
+        b1 = final_crc_sideB[i]
 
         da = a1 - a0
         db = b1 - b0
 
-        all_delta_crc_errors_sideA.append(da)
-        all_delta_crc_errors_sideB.append(db)
+        all_delta_crc_errors_sideA[i] = da
+        all_delta_crc_errors_sideB[i] = db
 
         # print(f"{f'MD{i}':<6}"
         #     f"{a0:<12}{a1:<12}{da:<12}"
@@ -583,7 +583,7 @@ def cis_test(ppr, feb, ppr_label):
     
     
     now = datetime.datetime.utcnow().isoformat()
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         
         for adc in range(nchanperMD):
             
@@ -693,7 +693,7 @@ def cis_test(ppr, feb, ppr_label):
     return all_points
 
 
-def cis_phase_scan(ppr, feb, ipbus, ppr_label):
+def cis_phase_scan(ppr, feb, ipbus, ppr_label, mds=None):
     """CIS pulse phase scan via cfb_mb_phase_config (32 steps / 25 ns).
 
     Runs LG capacitor then HG capacitor; records only the matching gain
@@ -703,8 +703,8 @@ def cis_phase_scan(ppr, feb, ipbus, ppr_label):
     dbside = 0
     nsamp = 16
     nchanperMD = 12
-    nMD = 4
-    firstMD = 0
+    nMD = N_MD
+    mds = resolve_mds(mds, nMD)
     n_events = 1
 
     bcid_l1a = 2246
@@ -726,8 +726,10 @@ def cis_phase_scan(ppr, feb, ipbus, ppr_label):
 
     DACbiasP, DACbiasN = feb.convert_ped_ADC_to_DACs(ADCped)
 
+    now = datetime.datetime.utcnow().isoformat()
+    
     for capacitor, gain_tag in capacitor_runs:
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
             for feb_id in range(nchanperMD):
                 feb.set_ped_HG_pos(md, dbside, feb_id, DACbiasP)
                 feb.set_ped_HG_neg(md, dbside, feb_id, DACbiasN)
@@ -736,28 +738,26 @@ def cis_phase_scan(ppr, feb, ipbus, ppr_label):
                 feb.load_ped_HG(md, dbside, feb_id)
                 feb.load_ped_LG(md, dbside, feb_id)
 
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
             for adc in range(nchanperMD):
                 feb.set_switches_noise(md, dbside=2, feb=adc)
 
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
             for feb_id in range(nchanperMD):
                 feb.set_CIS_BCID_settings(
                     md, dbside, BCID_charge, BCID_discharge, capacitor
                 )
 
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
             for feb_id in range(nchanperMD):
                 feb.set_CIS_DAC(md, dbside, feb_id, DACcharge)
 
         time.sleep(0.05)
 
-        now = datetime.datetime.utcnow().isoformat()
-
         for phase in phases:
             p = int(phase) & 0x1F
             word = (p << 23) | (p << 7)
-            for md in range(firstMD, firstMD + nMD):
+            for md in mds:
                 ipbus.DB_Write_Val(md, 0b10, phase_hw, word)
                 ipbus.DB_Write_Val(md, 0b11, phase_hw, word)
             time.sleep(0.02)
@@ -765,7 +765,7 @@ def cis_phase_scan(ppr, feb, ipbus, ppr_label):
             for event in range(n_events):
                 trigger_pipeline_readout(ppr, feb, bcid_l1a)
 
-                for md in range(firstMD, firstMD + nMD):
+                for md in mds:
                     for adc in range(nchanperMD):
                         if capacitor == 0:
                             samples = ppr.get_data_LG(md, adc, nsamp)
@@ -790,20 +790,20 @@ def cis_phase_scan(ppr, feb, ipbus, ppr_label):
                             })
 
     # Reset phase so subsequent cycle tests are not left at phase 31
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         ipbus.DB_Write_Val(md, 0b10, phase_hw, 0)
         ipbus.DB_Write_Val(md, 0b11, phase_hw, 0)
 
     return all_points
 
 
-def cis_lin_readout(ppr, feb, ppr_label, gain=0):
+def cis_lin_readout(ppr, feb, ppr_label, gain=0, mds=None):
     all_points = []
     
     nsamp = 16
     nchanperMD = 12
-    nMD = 4
-    firstMD = 0
+    nMD = N_MD
+    mds = resolve_mds(mds, nMD)
     dbside = 0
 
     n_events = 1
@@ -832,22 +832,22 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
 
 
     # print("Reading CRC counters... ")
-    initial_crc_sideA = []
-    initial_crc_sideB = []
-    final_crc_sideA = []
-    final_crc_sideB = []
+    initial_crc_sideA = [0] * nMD
+    initial_crc_sideB = [0] * nMD
+    final_crc_sideA = [0] * nMD
+    final_crc_sideB = [0] * nMD
 
     # print("Initial CRC Counters")
     # print("=" * 40)
     # print(f"{'MD':<6}{'Side A':<15}{'Side B':<15}")
     # print("-" * 40)
 
-    for i in range(firstMD, firstMD + nMD):
+    for i in mds:
         a = ppr.get_CRC_tot_errors(i, side="A")
         b = ppr.get_CRC_tot_errors(i, side="B")
 
-        initial_crc_sideA.append(a)
-        initial_crc_sideB.append(b)
+        initial_crc_sideA[i] = a
+        initial_crc_sideB[i] = b
 
 
     # ------------------ CONFIG PHASE -------------------
@@ -856,7 +856,7 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
     arm_pipeline_deadtime(ppr)
     DACbiasP, DACbiasN = feb.convert_ped_ADC_to_DACs(ADCped)
 
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         for feb_id in range(nchanperMD):
             feb.set_ped_HG_pos(md, dbside, feb_id, DACbiasP)
             feb.set_ped_HG_neg(md, dbside, feb_id, DACbiasN)
@@ -865,11 +865,11 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
             feb.load_ped_HG(md, dbside, feb_id)
             feb.load_ped_LG(md, dbside, feb_id)
 
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         for adc in range(nchanperMD):
             feb.set_switches_noise(md, dbside, feb=adc)
 
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         feb.set_CIS_BCID_settings(md, dbside, BCID_charge, BCID_discharge, gain)
 
 
@@ -884,26 +884,27 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
 
         # print(f"Step {step+1}/{nsteps}  DACcharge = {DACcharge}")
 
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
             for feb_id in range(nchanperMD):
                 feb.set_CIS_DAC(md, dbside, feb_id, DACcharge)
 
         time.sleep(0.05)
 
-        hg_peaks_step = []
-        lg_peaks_step = []
-        hg_centers_step = []
-        lg_centers_step = []
-        hg_fwhm_step = []
-        lg_fwhm_step = []
-        hg_pedestal_step = []
-        lg_pedestal_step = []
+        n_flat = nchanperMD * nMD
+        hg_peaks_step = [0.0] * n_flat
+        lg_peaks_step = [0.0] * n_flat
+        hg_centers_step = [0.0] * n_flat
+        lg_centers_step = [0.0] * n_flat
+        hg_fwhm_step = [0.0] * n_flat
+        lg_fwhm_step = [0.0] * n_flat
+        hg_pedestal_step = [0.0] * n_flat
+        lg_pedestal_step = [0.0] * n_flat
 
         for event in range(n_events):
             # One L1A latches all MDs; per-MD retries re-trigger only if needed
             trigger_pipeline_readout(ppr, feb, bcid_l1a)
 
-            for md in range(firstMD, firstMD + nMD):
+            for md in mds:
                 previous_hg = all_hg_peaks[-1][md*nchanperMD:(md+1)*nchanperMD] if step>0 else None
                 previous_lg = all_lg_peaks[-1][md*nchanperMD:(md+1)*nchanperMD] if step>0 else None
 
@@ -915,15 +916,16 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
                                             threshold=0.9, max_retries=0,
                                             trigger=False)
 
-                # Append MD data
-                hg_peaks_step.extend(hg_peaks_step_md)
-                lg_peaks_step.extend(lg_peaks_step_md)
-                hg_centers_step.extend(hg_centers_step_md)
-                lg_centers_step.extend(lg_centers_step_md)
-                hg_fwhm_step.extend(hg_fwhm_step_md)
-                lg_fwhm_step.extend(lg_fwhm_step_md)
-                hg_pedestal_step.extend(hg_pedestal_step_md)
-                lg_pedestal_step.extend(lg_pedestal_step_md)
+                start = md * nchanperMD
+                end = start + nchanperMD
+                hg_peaks_step[start:end] = hg_peaks_step_md
+                lg_peaks_step[start:end] = lg_peaks_step_md
+                hg_centers_step[start:end] = hg_centers_step_md
+                lg_centers_step[start:end] = lg_centers_step_md
+                hg_fwhm_step[start:end] = hg_fwhm_step_md
+                lg_fwhm_step[start:end] = lg_fwhm_step_md
+                hg_pedestal_step[start:end] = hg_pedestal_step_md
+                lg_pedestal_step[start:end] = lg_pedestal_step_md
 
         all_hg_peaks.append(hg_peaks_step)
         all_lg_peaks.append(lg_peaks_step)
@@ -935,31 +937,31 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
         all_lg_pedestal.append(lg_pedestal_step)
     
     
-    for i in range(firstMD, firstMD + nMD):
+    for i in mds:
         a = ppr.get_CRC_tot_errors(i, side="A")
         b = ppr.get_CRC_tot_errors(i, side="B")
 
-        final_crc_sideA.append(a)
-        final_crc_sideB.append(b)
+        final_crc_sideA[i] = a
+        final_crc_sideB[i] = b
 
     # print("\nFinal CRC Counters")
     # print("=" * 40)
     # print(f"{'MD':<6}{'A_init':<12}{'A_final':<12}{'ΔA':<12}"
     #     f"{'B_init':<12}{'B_final':<12}{'ΔB':<12}")
 
-    all_delta_crc_errors_sideA = []
-    all_delta_crc_errors_sideB = []
-    for idx, i in enumerate(range(firstMD, firstMD + nMD)):
-        a0 = initial_crc_sideA[idx]
-        b0 = initial_crc_sideB[idx]
-        a1 = final_crc_sideA[idx]
-        b1 = final_crc_sideB[idx]
+    all_delta_crc_errors_sideA = [0] * nMD
+    all_delta_crc_errors_sideB = [0] * nMD
+    for i in mds:
+        a0 = initial_crc_sideA[i]
+        b0 = initial_crc_sideB[i]
+        a1 = final_crc_sideA[i]
+        b1 = final_crc_sideB[i]
 
         da = a1 - a0
         db = b1 - b0
 
-        all_delta_crc_errors_sideA.append(da)
-        all_delta_crc_errors_sideB.append(db)
+        all_delta_crc_errors_sideA[i] = da
+        all_delta_crc_errors_sideB[i] = db
 
         # print(f"{f'MD{i}':<6}"
         #     f"{a0:<12}{a1:<12}{da:<12}"
@@ -967,7 +969,7 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
     
     now = datetime.datetime.utcnow().isoformat()
     
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
         # print(f"\n==> MD{md} summary")
 
         step_hg_peaks = np.array([all_hg_peaks[s][md * nchanperMD:(md + 1) * nchanperMD] for s in range(len(all_hg_peaks))])
@@ -1090,13 +1092,13 @@ def cis_lin_readout(ppr, feb, ppr_label, gain=0):
     return all_points
 
 
-def integrator_lin_test(ppr, feb, ppr_label, nsteps=20, step_events=1):
+def integrator_lin_test(ppr, feb, ppr_label, nsteps=20, step_events=1, mds=None):
     all_points = []
 
     nsamp = 1  # integrator readout returns 1 value
     nchanperMD = 12
-    nMD = 4
-    firstMD = 0
+    nMD = N_MD
+    mds = resolve_mds(mds, nMD)
     dbside = 0
 
     min_DAC = 0
@@ -1146,9 +1148,9 @@ def integrator_lin_test(ppr, feb, ppr_label, nsteps=20, step_events=1):
         ppr.reset_integrator_fifo()
         time.sleep(0.1)
 
-        step_values = []
+        step_values = [0.0] * (nchanperMD * nMD)
 
-        for md in range(firstMD, firstMD + nMD):
+        for md in mds:
             for adc in range(nchanperMD):
 
                 vals = []
@@ -1158,7 +1160,7 @@ def integrator_lin_test(ppr, feb, ppr_label, nsteps=20, step_events=1):
                         vals.append(max(data))
 
                 avg_val = sum(vals) / len(vals) if vals else 0
-                step_values.append(avg_val)
+                step_values[md * nchanperMD + adc] = avg_val
 
         all_values.append(step_values)
 
@@ -1169,7 +1171,7 @@ def integrator_lin_test(ppr, feb, ppr_label, nsteps=20, step_events=1):
 
     # ------------------ ANALYSIS -------------------
 
-    for md in range(firstMD, firstMD + nMD):
+    for md in mds:
 
         for ch in range(nchanperMD):
 
@@ -1335,8 +1337,9 @@ def compute_metrics(data, threshold=1e-6):
 
 
 
-def eye_diagram_test(ppr, ppr_label, threshold=1e-6, verbose=False):
+def eye_diagram_test(ppr, ppr_label, threshold=1e-6, verbose=False, mds=None):
     all_points = []
+    mds = set(resolve_mds(mds))
 
     md_labels = ["1", "2", "3", "4", "1", "2", "3", "4", "1", "2", "3", "4", "1", "2", "3", "4"]
     uplink_labels = ["A0", "A0", "A0", "A0", "A1", "A1", "A1", "A1", "B0", "B0", "B0", "B0", "B1", "B1", "B1", "B1"]
@@ -1363,6 +1366,8 @@ def eye_diagram_test(ppr, ppr_label, threshold=1e-6, verbose=False):
 
     # ------------------ ANALYSIS ------------------
     for l in range(nlanes):
+        if (l % N_MD) not in mds:
+            continue
 
         data = np.array(eye_data[l])
 

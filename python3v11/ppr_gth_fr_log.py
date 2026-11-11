@@ -85,11 +85,25 @@ parser.add_argument(
     help="PPr IP address"
 )
 
+parser.add_argument(
+    "--md",
+    default="1-4",
+    help="Minidrawers to monitor (1-based). Examples: 1-4, 1,3, 2-4, all"
+)
+
 args = parser.parse_args()
 
 ppr_label = args.ppr_label
 controlhub_ipaddress = args.controlhub_ip
 ppr_ipaddress = args.ppr_ip
+try:
+    mds = parse_md_spec(args.md)
+except ValueError as e:
+    parser.error(str(e))
+print(
+    "Monitoring minidrawers: "
+    + ", ".join(str(md + 1) for md in mds)
+)
 
 def connect_ppr():
     while True:
@@ -139,7 +153,7 @@ while True:
 
         if cycle % eye_every_n_cycles == 0:
             t0 = time.time()
-            all_points = eye_diagram_test(ppr, ppr_label)
+            all_points = eye_diagram_test(ppr, ppr_label, mds=mds)
             influxdb.write_points(all_points)
             del all_points
             gc.collect()
@@ -150,38 +164,38 @@ while True:
             time.sleep(last_eye_duration_s)
 
         # --- Normal cycle continues ---
-        all_points = integrator_lin_test(ppr, feb, ppr_label)
+        all_points = integrator_lin_test(ppr, feb, ppr_label, mds=mds)
         influxdb.write_points(all_points)
         del all_points
         gc.collect()
         time.sleep(wait_time)
         
 
-        all_points = adc_lin_test(ppr, feb, ppr_label)
+        all_points = adc_lin_test(ppr, feb, ppr_label, mds=mds)
         influxdb.write_points(all_points)
         del all_points
         gc.collect()
         time.sleep(wait_time)
 
-        all_points = cis_lin_readout(ppr, feb, ppr_label, gain=0)
+        all_points = cis_lin_readout(ppr, feb, ppr_label, gain=0, mds=mds)
         influxdb.write_points(all_points)
         del all_points
         gc.collect()
         time.sleep(wait_time)
 
-        all_points = cis_test(ppr, feb, ppr_label)
+        all_points = cis_test(ppr, feb, ppr_label, mds=mds)
         influxdb.write_points(all_points)
         del all_points
         gc.collect()
         time.sleep(wait_time)
 
-        all_points = cis_lin_readout(ppr, feb, ppr_label, gain=1)
+        all_points = cis_lin_readout(ppr, feb, ppr_label, gain=1, mds=mds)
         influxdb.write_points(all_points)
         del all_points
         gc.collect()
         time.sleep(wait_time)
 
-        all_points = cis_test(ppr, feb, ppr_label)
+        all_points = cis_test(ppr, feb, ppr_label, mds=mds)
         influxdb.write_points(all_points)
         del all_points
         gc.collect()
@@ -189,7 +203,7 @@ while True:
 
         if cycle % cis_phase_every_n_cycles == 0:
             t0 = time.time()
-            all_points = cis_phase_scan(ppr, feb, ipbus, ppr_label)
+            all_points = cis_phase_scan(ppr, feb, ipbus, ppr_label, mds=mds)
             influxdb.write_points(all_points)
             del all_points
             gc.collect()

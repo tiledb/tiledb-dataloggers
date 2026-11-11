@@ -1512,6 +1512,45 @@ class IPbus:
         for fpga in (0b10, 0b11):
             self.DB_Write_Val(md, fpga, CFB_GBTX_REG_CONFIG, base)
 
+    def SFP_Read_A0h_Identity(self, md):
+        """Read Vendor SN (A0h 68–83) and date code (A0h 84–91) from both cages.
+
+        Uses ``cfb_sfp_reg_address`` / ``stb_sfp_reg_readback``. Leaves the
+        pointer at A2h byte 0 when done. Returns [side][sfp] dicts.
+        """
+        first = SFP_A0H_VENDOR_SN[0]
+        last = SFP_A0H_DATECODE[1]
+        raw = [[[] for _ in range(2)] for _ in range(2)]
+        for offset in range(first, last + 1):
+            packed = pack_sfp_a0h_address(offset)
+            for fpga in (0b10, 0b11):
+                self.DB_Write_Val(md, fpga, CFB_SFP_REG_ADDRESS, packed)
+            time.sleep(0.01)
+            words = self.DB_Read_Val(
+                md, lut_tx_address[c_stb_sfp_reg_readback]
+            )
+            for side, word in enumerate(words):
+                if word is None or word == 0xFFFFFFFF:
+                    raw[side][0].append(None)
+                    raw[side][1].append(None)
+                    continue
+                word = int(word)
+                raw[side][0].append((word >> 16) & 0xFF)
+                raw[side][1].append((word >> 24) & 0xFF)
+        for fpga in (0b10, 0b11):
+            self.DB_Write_Val(md, fpga, CFB_SFP_REG_ADDRESS, 0)
+
+        sn_len = SFP_A0H_VENDOR_SN[1] - SFP_A0H_VENDOR_SN[0] + 1
+        ident = [[{}, {}], [{}, {}]]
+        for side in (0, 1):
+            for sfp_idx in (0, 1):
+                blob = raw[side][sfp_idx]
+                ident[side][sfp_idx] = {
+                    "vendor": decode_vendor_sn(blob[:sn_len]),
+                    "datecode": decode_datecode(blob[sn_len:]),
+                }
+        return ident
+
     def DB_Deskew_All_Channels(self, md, fpga, phase):
         if phase < 24949:
             value = phase
